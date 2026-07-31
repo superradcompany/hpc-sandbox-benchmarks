@@ -44,6 +44,7 @@ function cloudProvider() {
 	return microsandboxCloudCompute({
 		variant: "microsandbox-cloud",
 		backend: { kind: "cloud", apiKey: "offline-test-key" },
+		ephemeral: true,
 		image: "alpine:3.20",
 		cpus: 1,
 		memoryMib: 512,
@@ -57,6 +58,7 @@ function localProvider() {
 	return microsandboxLocalCompute({
 		variant: "microsandbox-local",
 		backend: "local",
+		ephemeral: false,
 		image: "alpine:3.20",
 		cpus: 1,
 		memoryMib: 512,
@@ -247,6 +249,35 @@ describe("Microsandbox provider edge cases", () => {
 		expect(maxDurationSecs).toBe(13);
 		expect(ephemeral).toBe(true);
 		expect((await sandbox.getInfo()).timeout).toBe(12_345);
+	});
+
+	it("keeps local snapshot qualification persistent", async () => {
+		let ephemeral: boolean | undefined;
+		let builder: Record<PropertyKey, unknown>;
+		builder = new Proxy(
+			{},
+			{
+				get: (_target, property) => {
+					if (property === "ephemeral") {
+						return (enabled: boolean) => {
+							ephemeral = enabled;
+							return builder;
+						};
+					}
+					if (property === "create") return async () => ({});
+					return () => builder;
+				},
+			},
+		);
+		restore(
+			spyOn(MsbSandbox, "builder").mockImplementation(
+				(() => builder) as unknown as typeof MsbSandbox.builder,
+			),
+		);
+
+		await localProvider().sandbox.create();
+
+		expect(ephemeral).toBe(false);
 	});
 
 	it("throws instead of replaying a command after an ambiguous agent failure", async () => {

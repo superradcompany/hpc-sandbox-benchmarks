@@ -43,6 +43,8 @@ export type MicrosandboxVariant = "microsandbox-local" | "microsandbox-cloud";
 interface MicrosandboxBaseConfig {
 	variant: MicrosandboxVariant;
 	backend: DefaultBackend;
+	/** Whether the provider should delete sandbox state when the sandbox stops. */
+	ephemeral: boolean;
 	/** OCI image to boot when create() receives no templateId. */
 	image: string;
 	/** Guest vCPUs. */
@@ -413,9 +415,7 @@ const sandboxMethods: SandboxMethods<MicrosandboxHandle, MicrosandboxConfig> = {
 					.memory(config.memoryMib)
 					.maxDuration(maxDurationSecs)
 					.detached(true)
-					// Cloud benchmarks have no snapshot lifecycle and must not pay persistent-sandbox
-					// capture costs during teardown. Local remains persistent for snapshot qualification.
-					.ephemeral(config.variant === "microsandbox-cloud")
+					.ephemeral(config.ephemeral)
 					.label(LABEL_MARKER, config.variant);
 				for (const [key, value] of Object.entries(metadata)) {
 					builder = builder.label(`${LABEL_META_PREFIX}${key}`, String(value));
