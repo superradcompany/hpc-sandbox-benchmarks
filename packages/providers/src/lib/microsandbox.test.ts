@@ -17,6 +17,8 @@ let builtName = "";
 let getNames: string[] = [];
 let removedNames: string[] = [];
 let stopCalls = 0;
+let requestStopCalls = 0;
+let waitUntilStoppedCalls = 0;
 let cleanupGetError: Error | undefined;
 let cleanupRemoveError: Error | undefined;
 let residueStatus = "error";
@@ -72,6 +74,8 @@ describe("Microsandbox failed-create cleanup", () => {
 		getNames = [];
 		removedNames = [];
 		stopCalls = 0;
+		requestStopCalls = 0;
+		waitUntilStoppedCalls = 0;
 		cleanupGetError = undefined;
 		cleanupRemoveError = undefined;
 		residueStatus = "error";
@@ -85,6 +89,13 @@ describe("Microsandbox failed-create cleanup", () => {
 				status: residueStatus,
 				stop: async () => {
 					stopCalls++;
+				},
+				requestStop: async () => {
+					requestStopCalls++;
+				},
+				waitUntilStopped: async () => {
+					waitUntilStoppedCalls++;
+					return { name, status: "stopped" };
 				},
 			} as unknown as Awaited<ReturnType<typeof MsbSandbox.get>>;
 		}) as typeof MsbSandbox.get);
@@ -109,14 +120,18 @@ describe("Microsandbox failed-create cleanup", () => {
 		expect(removedNames).toEqual([builtName]);
 		// status=error is not "stopped", so it is stopped first: remove() is documented as removing a
 		// STOPPED sandbox, and skipping the stop for a status outside the mapped set made it reject.
-		expect(stopCalls).toBe(1);
+		expect(stopCalls).toBe(0);
+		expect(requestStopCalls).toBe(1);
+		expect(waitUntilStoppedCalls).toBe(1);
 	});
 
 	it("stops a running partial sandbox before removing its record", async () => {
 		residueStatus = "running";
 		await expect(cloudProvider().sandbox.create()).rejects.toThrow(/simulated create failure/);
 
-		expect(stopCalls).toBe(1);
+		expect(stopCalls).toBe(0);
+		expect(requestStopCalls).toBe(1);
+		expect(waitUntilStoppedCalls).toBe(1);
 		expect(removedNames).toEqual([builtName]);
 	});
 
@@ -125,6 +140,8 @@ describe("Microsandbox failed-create cleanup", () => {
 		await expect(cloudProvider().sandbox.create()).rejects.toThrow(/simulated create failure/);
 
 		expect(stopCalls).toBe(0);
+		expect(requestStopCalls).toBe(0);
+		expect(waitUntilStoppedCalls).toBe(0);
 		expect(removedNames).toEqual([builtName]);
 	});
 
@@ -135,7 +152,9 @@ describe("Microsandbox failed-create cleanup", () => {
 		residueStatus = "crashed";
 		await expect(cloudProvider().sandbox.create()).rejects.toThrow(/simulated create failure/);
 
-		expect(stopCalls).toBe(1);
+		expect(stopCalls).toBe(0);
+		expect(requestStopCalls).toBe(1);
+		expect(waitUntilStoppedCalls).toBe(1);
 		expect(removedNames).toEqual([builtName]);
 	});
 
@@ -183,6 +202,7 @@ describe("Microsandbox provider edge cases", () => {
 
 	it("uses the per-create timeout as the native sandbox lifetime", async () => {
 		let maxDurationSecs = 0;
+		let ephemeral: boolean | undefined;
 		let builder: Record<PropertyKey, unknown>;
 		builder = new Proxy(
 			{},
@@ -191,6 +211,12 @@ describe("Microsandbox provider edge cases", () => {
 					if (property === "maxDuration") {
 						return (seconds: number) => {
 							maxDurationSecs = seconds;
+							return builder;
+						};
+					}
+					if (property === "ephemeral") {
+						return (enabled: boolean) => {
+							ephemeral = enabled;
 							return builder;
 						};
 					}
@@ -219,6 +245,7 @@ describe("Microsandbox provider edge cases", () => {
 		const sandbox = await cloudProvider().sandbox.create({ timeout: 12_345 });
 
 		expect(maxDurationSecs).toBe(13);
+		expect(ephemeral).toBe(true);
 		expect((await sandbox.getInfo()).timeout).toBe(12_345);
 	});
 

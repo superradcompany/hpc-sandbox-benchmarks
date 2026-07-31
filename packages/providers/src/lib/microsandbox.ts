@@ -231,7 +231,17 @@ async function removeSandboxIfPresent(
 			// precisely because transitional/unknown statuses (a cloud record still booting, `crashed`) do
 			// occur — skipping the stop for those made remove() reject and leaked the microVM until its
 			// maxDuration expired.
-			if (handle.status !== "stopped") await handle.stop();
+			if (handle.status !== "stopped") {
+				if (config.variant === "microsandbox-cloud") {
+					// Cloud stop can legitimately take longer than the SDK's 10-second graceful window.
+					// Requesting and observing it separately avoids stop() escalating to kill(), which the
+					// cloud backend intentionally does not support.
+					await handle.requestStop();
+					await handle.waitUntilStopped();
+				} else {
+					await handle.stop();
+				}
+			}
 			await MsbSandbox.remove(sandboxId);
 		} catch (error) {
 			if (isNotFound(error)) return;
@@ -403,6 +413,9 @@ const sandboxMethods: SandboxMethods<MicrosandboxHandle, MicrosandboxConfig> = {
 					.memory(config.memoryMib)
 					.maxDuration(maxDurationSecs)
 					.detached(true)
+					// Cloud benchmarks have no snapshot lifecycle and must not pay persistent-sandbox
+					// capture costs during teardown. Local remains persistent for snapshot qualification.
+					.ephemeral(config.variant === "microsandbox-cloud")
 					.label(LABEL_MARKER, config.variant);
 				for (const [key, value] of Object.entries(metadata)) {
 					builder = builder.label(`${LABEL_META_PREFIX}${key}`, String(value));
