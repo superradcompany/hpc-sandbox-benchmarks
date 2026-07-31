@@ -201,6 +201,9 @@ jobs:
       # bin writes ONE job summary for the whole fleet (a row per replicate) + a run annotation.
       - name: Run suite and normalize
         env:
+          # Clone the repository that owns this workflow. This matters for fork-only qualification
+          # branches: their commit SHA cannot be resolved from the upstream repository.
+          BENCH_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
           BENCH_REPO_REF: ${{ github.sha }}
           # Optional once the repo is public (anonymous clone works). Still passed so private forks and
           # rate-limited clones keep working via the short-lived job token.
