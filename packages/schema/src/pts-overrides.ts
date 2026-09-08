@@ -127,6 +127,16 @@ export const ptsOverrides: Record<string, MetricOverride> = {
 	// catalog load (an off-dimension metric would otherwise land under the wrong axis). Mastra's cold
 	// install is the dimension's headline: cold install is the phase every CI pipeline pays regardless
 	// of language/framework, and Mastra's is the fastest of the three realworld repos to run.
+	realworld_mastra_v2_task_cold_install: {
+		dimension: "realworld",
+		label: "Mastra v2: cold install",
+	},
+	realworld_mastra_v2_task_git_clone: { dimension: "realworld", label: "Mastra v2: git clone" },
+	realworld_mastra_v2_task_lint_format: { dimension: "realworld", label: "Mastra v2: lint:format" },
+	realworld_mastra_v2_task_build_core: { dimension: "realworld", label: "Mastra v2: build:core" },
+	realworld_mastra_v2_task_test_core: { dimension: "realworld", label: "Mastra v2: test:core" },
+
+	// Historical Mastra v1 catalog entries remain available.
 	realworld_mastra_task_cold_install: {
 		dimension: "realworld",
 		headline: true,
@@ -140,6 +150,7 @@ export const ptsOverrides: Record<string, MetricOverride> = {
 	// Realworld dimension (ENG-136): better-auth/better-auth run through its own CI tasks, a
 	// repo-local PTS profile with a Task option axis. TestType System's default dimension is
 	// corrected to realworld here for every metric this profile generates.
+
 	realworld_better_auth_task_git_clone: { dimension: "realworld", label: "Better-Auth: git clone" },
 	realworld_better_auth_task_cold_install: {
 		dimension: "realworld",
