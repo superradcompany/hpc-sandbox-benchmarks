@@ -89,8 +89,9 @@ export function setupSteps(suite: Suite): SetupStep[] {
 	];
 
 	if (suite.setupNode) {
+		const nodeVersion = suite.nodeVersion ?? NODE_VERSION;
 		steps.push({
-			label: "setup node 22 + pnpm 10",
+			label: suite.nodeVersion ? `setup node ${nodeVersion} + pnpm 10` : "setup node 22 + pnpm 10",
 			// Activate only the benchmark runtimes from outside the checkout. Exact Node avoids version
 			// discovery, and pnpm comes from npm rather than mise's GitHub-API-backed aqua plugin. Blaxel
 			// matrix cells share one unauthenticated egress IP, so even the one pnpm API lookup can hit an
@@ -98,7 +99,7 @@ export function setupSteps(suite: Suite): SetupStep[] {
 			// task auto-install stays off. The pinned baked image takes the fast path for both checks.
 			script: [
 				`cd "$HOME"`,
-				`(node -e 'process.exit(process.versions.node === "${NODE_VERSION}" ? 0 : 1)' 2>/dev/null || mise use --global --yes node@${NODE_VERSION})`,
+				`(node -e 'process.exit(process.versions.node === "${nodeVersion}" ? 0 : 1)' 2>/dev/null || mise use --global --yes node@${nodeVersion})`,
 				`if command -v pnpm >/dev/null 2>&1 && [ "$(pnpm -v)" = "${PNPM_VERSION}" ]; then :; else npm install --global --prefix "$HOME/.local" pnpm@${PNPM_VERSION}; fi`,
 				"node -v && pnpm -v",
 			].join(" && "),

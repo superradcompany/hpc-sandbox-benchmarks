@@ -53,3 +53,27 @@ grep -q '"task":"test_types","exitCode":7' "$out/task-outcomes.jsonl"
 grep -q 'GOMEMLIMIT=2GiB GOGC=10 GOMAXPROCS=1 pnpm check:test-types' "$out/target.env"
 [ -f "$out/compiler-samples.jsonl" ]
 printf 'single complete test-type probe preserves configured Go controls and sampler evidence\n'
+cp "$repo/lib/pts/realworld/openclaw-v2-throttled.env" "$fixture/lib/pts/realworld/"
+code=0
+bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 all openclaw-v2-all-throttled-fd-v1 || code=$?
+[ "$code" = 7 ]
+out="$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd-v1"
+[ "$(wc -l < "$out/task-outcomes.jsonl")" = 8 ]
+grep -q 'TASK_CMD_lint_oxlint="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled pnpm lint"' "$out/target.env"
+grep -q 'TASK_CMD_typecheck="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled pnpm tsgo:prod"' "$out/target.env"
+for task in git_clone cold_install lint_oxlint lint_extensions typecheck npm_lock_check test_unit_fast test_types; do
+  grep -q "\"task\":\"$task\",\"exitCode\":7" "$out/task-outcomes.jsonl"
+done
+printf 'throttled candidate preserves all eight tasks and exact command overrides\n'
+
+code=0
+(ulimit -Sn 4096; ulimit -Hn 4096; bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 all openclaw-v2-all-throttled-fd16384-v1) || code=$?
+[ "$code" = 1 ]
+mv "$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd16384-v1" "$fixture/benchmark-results/rejected-nofile4096"
+code=0
+(ulimit -Sn 16384; ulimit -Hn 16384; bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 all openclaw-v2-all-throttled-fd16384-v1) || code=$?
+[ "$code" = 7 ]
+out="$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd16384-v1"
+[ "$(wc -l < "$out/task-outcomes.jsonl")" = 8 ]
+grep -q 'nofile_after soft=16384 hard=16384' "$out/environment.log"
+printf 'explicit nofile candidate rejects wrong limits and preserves all eight tasks\n'

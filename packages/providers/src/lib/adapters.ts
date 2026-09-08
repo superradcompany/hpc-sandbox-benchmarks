@@ -105,6 +105,22 @@ function microsandboxCloudCredentials(): { kind: "cloud"; url?: string; apiKey: 
 	return apiUrl ? { kind: "cloud", url: apiUrl, apiKey } : { kind: "cloud", apiKey };
 }
 
+/** Explicit diagnostic resource override; omitted preserves the scored adapter defaults. */
+export function createMicrosandboxCloudCompute(nofile?: 16384) {
+	return microsandboxCloudCompute({
+		nofile,
+		variant: "microsandbox-cloud",
+		backend: microsandboxCloudCredentials(),
+		ephemeral: true,
+		image: config.toolchainImage,
+		cpus: TARGET_SPEC.vcpus,
+		memoryMib: TARGET_SPEC.memoryGb * 1024,
+		rootDiskMib: TARGET_SPEC.diskGb * 1024,
+		namePrefix: "bench-cloud-",
+		timeoutMs: MICROSANDBOX_MAX_DURATION_SECS * 1000,
+	});
+}
+
 /**
  * Harness adapters, keyed by the schema {@link ProviderId}. The `Record<ProviderId, …>` type is what
  * keeps the two registries honest: it forces exactly one adapter per schema provider, so a provider
@@ -162,18 +178,7 @@ export const adapters: Record<ProviderId, ProviderAdapter> = {
 	"microsandbox-cloud": {
 		// The API key remains in the CloudBackend HTTP/WebSocket client. It is never forwarded through
 		// createOptions, metadata, or the benchmark's in-guest environment.
-		createCompute: () =>
-			microsandboxCloudCompute({
-				variant: "microsandbox-cloud",
-				backend: microsandboxCloudCredentials(),
-				ephemeral: true,
-				image: config.toolchainImage,
-				cpus: TARGET_SPEC.vcpus,
-				memoryMib: TARGET_SPEC.memoryGb * 1024,
-				rootDiskMib: TARGET_SPEC.diskGb * 1024,
-				namePrefix: "bench-cloud-",
-				timeoutMs: MICROSANDBOX_MAX_DURATION_SECS * 1000,
-			}),
+		createCompute: () => createMicrosandboxCloudCompute(),
 		createOptions: { templateId: config.toolchainImage },
 		createTimeoutMs: MICROSANDBOX_CREATE_TIMEOUT_MS,
 	},

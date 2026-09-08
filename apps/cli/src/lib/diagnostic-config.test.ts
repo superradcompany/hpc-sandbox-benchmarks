@@ -42,11 +42,17 @@ test("only fixed configurations and diagnostic guest IDs are accepted", () => {
 	expect(() => diagnosticSandboxId("user-sandbox")).toThrow();
 	expect(() => diagnosticSandboxId("bench-cloud-diag-123-1;whoami")).toThrow();
 });
-test("versioned OpenClaw sequence uses the bounded lifecycle", () => {
-	expect(diagnosticConfig("openclaw-v2-all-fd-hard-v1")).toBe("openclaw-v2-all-fd-hard-v1");
-	const result = invoke("run", { DIAGNOSTIC_CONFIG: "openclaw-v2-all-fd-hard-v1" });
+test.each([
+	"openclaw-v2-all-fd-hard-v1",
+	"openclaw-v2-all-throttled-fd-v1",
+])("versioned OpenClaw sequence uses the bounded lifecycle: %s", (configuration) => {
+	expect(diagnosticConfig(configuration)).toBe(configuration);
+	const result = invoke("run", { DIAGNOSTIC_CONFIG: configuration });
 	expect(result.code).toBe(0);
 	expect(result.calls).toContain("collect diagnostic logs\ndestroy\n");
+	if (configuration === "openclaw-v2-all-throttled-fd-v1")
+		expect(result.calls).toContain("setupNodeVersion:24.16.0");
+	else expect(result.calls).not.toContain("setupNodeVersion:");
 });
 test("bounded test-type compiler probe uses the normal lifecycle", () => {
 	const result = invoke("run", { DIAGNOSTIC_CONFIG: "openclaw-v2-test-types-go2g-v1" });
@@ -77,4 +83,15 @@ test("ownership mismatch neither executes nor deletes a guest", () => {
 	const result = invoke("run", { FOREIGN_GUEST: "1" });
 	expect(result.code).toBe(1);
 	expect(result.calls).toBe("");
+});
+
+test("fd16384 candidate requests native limits and Node24 without changing default", () => {
+	const configuration = "openclaw-v2-all-throttled-fd16384-v1";
+	expect(diagnosticConfig(configuration)).toBe(configuration);
+	const created = invoke("create", { DIAGNOSTIC_CONFIG: configuration });
+	expect(created.code).toBe(0);
+	expect(created.calls).toBe("requestedNofile:16384\ncreate:bench-cloud-diag-123-1:7200000\n");
+	const ran = invoke("run", { DIAGNOSTIC_CONFIG: configuration });
+	expect(ran.code).toBe(0);
+	expect(ran.calls).toContain("setupNodeVersion:24.16.0");
 });
