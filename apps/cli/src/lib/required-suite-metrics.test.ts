@@ -18,7 +18,7 @@ function shard(suite: SuiteName, omitted: string[] = []): Run {
 }
 
 test("partial Mastra success cannot hide the failed core test", () => {
-	const missing = "realworld_mastra_task_test_core";
+	const missing = "realworld_mastra_v2_task_test_core";
 	expect(
 		missingSuiteMetrics(
 			shard("realworld-mastra", [missing]),
