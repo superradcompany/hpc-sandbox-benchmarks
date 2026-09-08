@@ -16,3 +16,7 @@ export function diagnosticSandboxId(value: string): string {
 		throw new Error("Not a diagnostic sandbox ID");
 	return value;
 }
+
+export function diagnosticNodeVersion(value: Diagnostic): "24.16.0" | undefined {
+	return value === "openclaw-v2-all-throttled-fd-v1" ? "24.16.0" : undefined;
+}

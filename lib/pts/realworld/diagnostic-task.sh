@@ -62,6 +62,7 @@ fi
 {
 printf 'config=%s suite=%s task=%s artifact_dir=%s\n' "$config" "$suite" "$task" "$root"
 printf 'harness_sha=%s\n' "$(git -C "$repo" rev-parse HEAD)"
+printf 'node_version=%s\n' "$(node --version)"
 printf 'nofile_before soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
 } | tee "$root/environment.log"
 if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-test-types-go2g-v1 || "$config" = openclaw-v2-all-throttled-fd-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi

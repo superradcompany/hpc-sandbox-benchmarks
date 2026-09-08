@@ -24,6 +24,8 @@ export interface Suite {
 	setupPts?: boolean;
 	/** Install Node 22 + pnpm 10 during setup. */
 	setupNode?: boolean;
+	/** Explicit runtime for versioned workloads; all existing suites keep Node22. */
+	nodeVersion?: "24.16.0";
 	/** Timeout applied to each benchmark command, in minutes. */
 	commandTimeoutMinutes: number;
 	/** Requested sandbox lifetime, in minutes (covers setup + the suite). */

@@ -39,7 +39,10 @@ mock.module("@sandbox-benchmarks/providers", () => ({
 }));
 mock.module("@sandbox-benchmarks/harness", () => ({
 	DIR: "/repo",
-	setupSteps: () => [],
+	setupSteps: (suite: { nodeVersion?: string }) => {
+		if (suite.nodeVersion) record(`setupNodeVersion:${suite.nodeVersion}`);
+		return [];
+	},
 	StepRunner: class {
 		stepLog: unknown[] = [];
 		async step(label: string) {

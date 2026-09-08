@@ -50,6 +50,9 @@ test.each([
 	const result = invoke("run", { DIAGNOSTIC_CONFIG: configuration });
 	expect(result.code).toBe(0);
 	expect(result.calls).toContain("collect diagnostic logs\ndestroy\n");
+	if (configuration === "openclaw-v2-all-throttled-fd-v1")
+		expect(result.calls).toContain("setupNodeVersion:24.16.0");
+	else expect(result.calls).not.toContain("setupNodeVersion:");
 });
 test("bounded test-type compiler probe uses the normal lifecycle", () => {
 	const result = invoke("run", { DIAGNOSTIC_CONFIG: "openclaw-v2-test-types-go2g-v1" });

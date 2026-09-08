@@ -3,6 +3,18 @@ import { SUITES } from "@sandbox-benchmarks/schema";
 import { REPO_URL, setupSteps } from "./setup.ts";
 
 describe("setupSteps", () => {
+	it("provisions an explicitly versioned runtime while existing suites keep their Node pin", () => {
+		const custom = setupSteps({ ...SUITES["realworld-openclaw"], nodeVersion: "24.16.0" }).find(
+			(step) => step.label.startsWith("setup node"),
+		);
+		expect(custom?.script).toContain('process.versions.node === "24.16.0"');
+		expect(custom?.script).toContain("node@24.16.0");
+		const original = setupSteps(SUITES["realworld-openclaw"]).find((step) =>
+			step.label.startsWith("setup node"),
+		);
+		expect(original?.script).toContain("node@22.22.3");
+		expect(original?.script).not.toContain("24.16.0");
+	});
 	const labels = setupSteps(SUITES["cpu-node"]).map((step) => step.label);
 
 	it("clones the repo and brings the toolchain up (node + PTS for cpu-node)", () => {

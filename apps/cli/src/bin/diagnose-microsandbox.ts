@@ -3,7 +3,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { DIR, StepRunner, setupSteps } from "@sandbox-benchmarks/harness";
 import { providers } from "@sandbox-benchmarks/providers";
 import { SUITES } from "@sandbox-benchmarks/schema";
-import { DIAGNOSTICS, diagnosticConfig, diagnosticSandboxId } from "../lib/diagnostic-config.ts";
+import {
+	DIAGNOSTICS,
+	diagnosticConfig,
+	diagnosticNodeVersion,
+	diagnosticSandboxId,
+} from "../lib/diagnostic-config.ts";
 
 const mode = process.env.DIAGNOSTIC_MODE;
 if (!["create", "run", "cleanup"].includes(mode ?? "")) throw new Error("Invalid diagnostic mode");
@@ -72,7 +77,11 @@ try {
 		} else {
 			const runner = new StepRunner(sandbox, provider.transport);
 			try {
-				for (const step of setupSteps({ ...SUITES["realworld-mastra"], setupPts: false })) {
+				for (const step of setupSteps({
+					...SUITES["realworld-mastra"],
+					setupPts: false,
+					nodeVersion: diagnosticNodeVersion(config),
+				})) {
 					await runner.step(step.label, step.script, step.timeoutMs);
 				}
 				await runner.step(
