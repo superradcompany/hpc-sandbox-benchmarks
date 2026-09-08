@@ -62,6 +62,7 @@ out="$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd-v1"
 [ "$(wc -l < "$out/task-outcomes.jsonl")" = 8 ]
 grep -q 'TASK_CMD_lint_oxlint="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled pnpm lint"' "$out/target.env"
 grep -q 'TASK_CMD_typecheck="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled pnpm tsgo:prod"' "$out/target.env"
+grep -Fq 'TASK_CMD_lint_extensions="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled node --import ./scripts/tsx.mjs scripts/run-oxlint-shards.mts --only=extensions"' "$out/target.env"
 for task in git_clone cold_install lint_oxlint lint_extensions typecheck npm_lock_check test_unit_fast test_types; do
   grep -q "\"task\":\"$task\",\"exitCode\":7" "$out/task-outcomes.jsonl"
 done
