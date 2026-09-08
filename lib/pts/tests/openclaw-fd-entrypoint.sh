@@ -20,6 +20,6 @@ STUB
 bash -c 'ulimit -Sn 256; ulimit -Hn 4096; exec bash "$1"' _ \
   "$fixture/.mise/tasks/benchmark/realworld/pts/openclaw-v2" > "$fixture/result.log"
 cat "$fixture/result.log"
-rg -q '^OPENCLAW_FD_BEFORE soft=256 hard=4096$' "$fixture/result.log"
-rg -q '^OPENCLAW_FD_AFTER soft=4096 hard=4096$' "$fixture/result.log"
-rg -q '^V2 task and child inherited soft=4096 hard=4096$' "$fixture/result.log"
+grep -q '^OPENCLAW_FD_BEFORE soft=256 hard=4096$' "$fixture/result.log"
+grep -q '^OPENCLAW_FD_AFTER soft=4096 hard=4096$' "$fixture/result.log"
+grep -q '^V2 task and child inherited soft=4096 hard=4096$' "$fixture/result.log"
