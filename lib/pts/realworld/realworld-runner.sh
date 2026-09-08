@@ -28,6 +28,9 @@ WORK_DIR="${SCRIPT_DIR}/work"
 # handling) can't leak cache state across runs or providers.
 export XDG_CACHE_HOME="${SCRIPT_DIR}/.cache"
 export COREPACK_HOME="${SCRIPT_DIR}/.corepack"
+if [ "${PACKAGE_MANAGER_DRIVER:-}" = corepack ]; then
+	export PATH="${SCRIPT_DIR}/.package-manager-bin:${PATH}"
+fi
 # pnpm's content-addressable STORE is what makes an install cold or warm, and pinning it is the
 # whole reason cold_install can claim to measure a cold install. Three knobs, because which one
 # bites depends on the pnpm each profile's packageManager field pins. They are listed in pnpm's
