@@ -180,7 +180,7 @@ run_bounded() {
 		fi
 	fi
 	if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
-		echo "task '${TASK}' command timed out or was killed after ${TASK_TIMEOUT_SECONDS}s (exit ${status})" >&2
+		echo "task '${TASK}' command terminated (exit ${status}; configured timeout ${TASK_TIMEOUT_SECONDS}s)" >&2
 		# Terminal-state snapshot into the (already-redirected) task log so the forensics tarball
 		# can settle thrash-vs-deadlock for a hung provider.
 		head -3 /proc/meminfo >&2 2>/dev/null || true

@@ -16,6 +16,7 @@ printf 'install fixture\n'
 INSTALL
 cat > "$fixture/lib/pts/realworld/realworld-runner.sh" <<'RUNNER'
 printf 'task fixture %s\n' "$1"
+sleep 1
 exit 7
 RUNNER
 git -C "$fixture" init -q
@@ -41,3 +42,14 @@ for task in git_clone cold_install lint_oxlint lint_extensions typecheck npm_loc
   grep -q "\"task\":\"$task\",\"exitCode\":7" "$out/task-outcomes.jsonl"
 done
 printf 'all eight v2 tasks preserve individual failures and continue sequentially\n'
+
+cp "$repo/lib/pts/realworld/compiler-sampler.mjs" "$fixture/lib/pts/realworld/"
+code=0
+bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 test_types openclaw-v2-test-types-go2g-v1 || code=$?
+[ "$code" = 7 ]
+out="$fixture/benchmark-results/diagnostic-openclaw-v2-test-types-go2g-v1"
+[ "$(wc -l < "$out/task-outcomes.jsonl")" = 1 ]
+grep -q '"task":"test_types","exitCode":7' "$out/task-outcomes.jsonl"
+grep -q 'GOMEMLIMIT=2GiB GOGC=10 GOMAXPROCS=1 pnpm check:test-types' "$out/target.env"
+[ -f "$out/compiler-samples.jsonl" ]
+printf 'single complete test-type probe preserves configured Go controls and sampler evidence\n'
