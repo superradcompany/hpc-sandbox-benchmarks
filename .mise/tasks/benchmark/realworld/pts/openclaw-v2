@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+#MISE description="PTS: OpenClaw V2 tasks with the validated inherited-hard FD budget"
+set -euo pipefail
+REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+source "${REPO_ROOT}/lib/bench.sh"
+
+# Match the bounded V2 diagnostic before installation and all measured tasks.
+fd_hard_before="$(ulimit -Hn)"
+printf 'OPENCLAW_FD_BEFORE soft=%s hard=%s\n' "$(ulimit -Sn)" "$fd_hard_before"
+ulimit -Sn "$fd_hard_before"
+printf 'OPENCLAW_FD_AFTER soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
+[[ "$(ulimit -Hn)" == "$fd_hard_before" ]]
+run_realworld_pts openclaw-v2
