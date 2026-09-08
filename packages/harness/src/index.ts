@@ -628,3 +628,7 @@ export function unmetRequirements(
 	const passed = new Set(reports.filter((r) => r.status === "ok").map((r) => r.provider));
 	return required.filter((id) => !passed.has(id));
 }
+
+// Reuse the normal setup and durable transport for bounded, unscored diagnostics.
+export { StepRunner } from "./lib/execute.ts";
+export { DIR, setupSteps } from "./lib/setup.ts";
