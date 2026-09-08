@@ -524,6 +524,39 @@ describe("createSuiteSandbox (creation-failure marker)", () => {
 	});
 });
 
+it("gated creation tags the workflow and suite for live allocation lookup", async () => {
+	const oldGate = process.env.BENCH_PLACEMENT_GATE;
+	const oldRun = process.env.GITHUB_RUN_ID;
+	process.env.BENCH_PLACEMENT_GATE = "true";
+	process.env.GITHUB_RUN_ID = "34123456789";
+	let options: unknown;
+	try {
+		await createSuiteSandbox(
+			() => ({
+				sandbox: {
+					create: async (value) => {
+						options = value;
+						return makeSandbox({ destroyed: { hit: false } });
+					},
+				},
+			}),
+			createCtx(freshDir()),
+		);
+		expect(options).toMatchObject({
+			metadata: {
+				benchmark_run_id: "34123456789",
+				benchmark_suite: "cpu-node",
+				placement_gate: "true",
+			},
+		});
+	} finally {
+		if (oldGate === undefined) delete process.env.BENCH_PLACEMENT_GATE;
+		else process.env.BENCH_PLACEMENT_GATE = oldGate;
+		if (oldRun === undefined) delete process.env.GITHUB_RUN_ID;
+		else process.env.GITHUB_RUN_ID = oldRun;
+	}
+});
+
 describe("runSuiteOnSandbox (orchestration + teardown)", () => {
 	it.each([
 		false,

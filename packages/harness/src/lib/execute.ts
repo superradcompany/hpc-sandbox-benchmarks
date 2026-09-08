@@ -121,6 +121,8 @@ export interface SandboxFilesystem {
 
 /** The slice of a computesdk sandbox the suite runner needs (its `Sandbox` satisfies this). */
 export interface SandboxHandle {
+	/** Provider identity, when available, for live placement verification. */
+	sandboxId?: string;
 	runCommand(command: string, options?: RunCommandOptions): Promise<CommandResult>;
 	destroy(): Promise<unknown>;
 	/** Present on real computesdk sandboxes; enables the durable detached transport for long steps. */
