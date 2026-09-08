@@ -57,6 +57,14 @@ export PNPM_HOME="${PWD}/.pnpm-home"
 export MISE_DATA_DIR="${MISE_DATA_DIR:-${HOME}/.local/share/mise}"
 export XDG_DATA_HOME="${PWD}/.local-share"
 
+# Opt-in for profiles whose pinned pnpm needs Corepack's native-binary bootstrap.
+# Keep this shim outside the dependency caches cleared by cold_install.
+if [ "${PACKAGE_MANAGER_DRIVER:-}" = corepack ]; then
+	mkdir -p "${PWD}/.package-manager-bin"
+	corepack enable --install-directory "${PWD}/.package-manager-bin"
+	export PATH="${PWD}/.package-manager-bin:${PATH}"
+fi
+
 if ! command -v node >/dev/null 2>&1; then
 	echo "ERROR: node not found (the sandbox harness's setupNode step provisions it)" >&2
 	echo 1 > ~/install-exit-status
