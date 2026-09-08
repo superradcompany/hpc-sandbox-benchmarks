@@ -307,11 +307,19 @@ function makeSandbox(opts: {
 	collectFiles?: Record<string, string>;
 	/** Never answer the readiness probe — a sandbox whose image never finishes pulling. */
 	neverReady?: boolean;
+	placementFails?: boolean;
+	steps?: string[];
 	destroyed: { hit: boolean };
 }): SandboxHandle {
 	// Results of detached steps, keyed by their /tmp/<tag> so the cat-polls can read them back.
 	const detached = new Map<string, { exit: number; out: string }>();
 	const resultFor = (command: string): CommandResult => {
+		opts.steps?.push(command);
+		if (command.includes("hpc-benchmark-placement-ready"))
+			return opts.placementFails
+				? { exitCode: 124, stderr: "placement deadline" }
+				: { exitCode: 0 };
+
 		if (command.includes("df -Pk")) return { exitCode: 0, stdout: opts.freeKb ?? "999999999" };
 		if (command.includes("base64")) {
 			if (opts.collectFails) return { exitCode: 1, stderr: "collect boom" };
@@ -516,7 +524,58 @@ describe("createSuiteSandbox (creation-failure marker)", () => {
 	});
 });
 
+it("gated creation tags the workflow and suite for live allocation lookup", async () => {
+	const oldGate = process.env.BENCH_PLACEMENT_GATE;
+	const oldRun = process.env.GITHUB_RUN_ID;
+	process.env.BENCH_PLACEMENT_GATE = "true";
+	process.env.GITHUB_RUN_ID = "34123456789";
+	let options: unknown;
+	try {
+		await createSuiteSandbox(
+			() => ({
+				sandbox: {
+					create: async (value) => {
+						options = value;
+						return makeSandbox({ destroyed: { hit: false } });
+					},
+				},
+			}),
+			ctx(suite({}), freshDir()),
+		);
+		expect(options).toMatchObject({
+			metadata: {
+				benchmark_run_id: "34123456789",
+				benchmark_suite: "cpu-node",
+				placement_gate: "true",
+			},
+		});
+	} finally {
+		if (oldGate === undefined) delete process.env.BENCH_PLACEMENT_GATE;
+		else process.env.BENCH_PLACEMENT_GATE = oldGate;
+		if (oldRun === undefined) delete process.env.GITHUB_RUN_ID;
+		else process.env.GITHUB_RUN_ID = oldRun;
+	}
+});
+
 describe("runSuiteOnSandbox (orchestration + teardown)", () => {
+	it.each([
+		false,
+		true,
+	])("placement gate precedes all work and failure cleans up: %s", async (fails) => {
+		const destroyed = { hit: false };
+		const steps: string[] = [];
+		const sandbox = makeSandbox({ destroyed, steps, placementFails: fails });
+		const result = runSuiteOnSandbox(sandbox, {
+			...ctx(suite({}), freshDir()),
+			placementGate: true,
+		});
+		if (fails) await expect(result).rejects.toThrow(/placement/);
+		else await result;
+		expect(steps[0]).toContain("hpc-benchmark-placement-ready");
+		expect(steps.some((step) => step.includes("benchmark-cmd"))).toBe(!fails);
+		expect(destroyed.hit).toBe(true);
+	});
+
 	it("runs the suite, collects results, and tears the sandbox down", async () => {
 		const resultsDir = freshDir();
 		const destroyed = { hit: false };

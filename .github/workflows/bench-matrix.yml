@@ -90,6 +90,11 @@ on:
         required: false
         type: boolean
         default: false
+      placement_gate:
+        description: 'Wait up to two minutes for explicit in-guest placement readiness before any setup or benchmark work.'
+        required: false
+        type: boolean
+        default: false
       allow_overlap:
         description: 'Allow this run alongside another run on the same branch. Use for disjoint suite batches after checking shared provider capacity.'
         required: false
@@ -200,6 +205,7 @@ jobs:
       pts_passes: ${{ inputs.pts_passes }}
       # Forward the per-cell replicate concurrency cap unchanged (blank = all R sandboxes at once).
       max_concurrency: ${{ inputs.max_concurrency }}
+      placement_gate: ${{ inputs.placement_gate }}
     secrets: inherit
 
   # Collect every shard Run, aggregate into one candidate, gate it (promote), and commit the machine-

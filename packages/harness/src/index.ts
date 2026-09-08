@@ -311,11 +311,30 @@ export async function createSuiteSandbox(
 			createPromise = Promise.resolve(
 				compute.sandbox.create({
 					...createOptions,
+					...(process.env.BENCH_PLACEMENT_GATE === "true"
+						? {
+								metadata: {
+									...createOptions?.metadata,
+									benchmark_run_id: process.env.GITHUB_RUN_ID ?? "local",
+									benchmark_suite: suiteName,
+									placement_gate: "true",
+								},
+							}
+						: {}),
 					// Ask for a sandbox lifetime covering setup + the suite, where supported.
 					timeout: suite.timeoutMinutes * MIN,
 				}),
 			);
-			return await withTimeout(createPromise, createTimeoutMs, "Sandbox creation timed out");
+			const sandbox = await withTimeout(
+				createPromise,
+				createTimeoutMs,
+				"Sandbox creation timed out",
+			);
+			if (process.env.BENCH_PLACEMENT_GATE === "true")
+				console.log(
+					`PLACEMENT_WAIT_SANDBOX=${sandbox.sandboxId ?? "see benchmark_run_id metadata"}`,
+				);
+			return sandbox;
 		} catch (err) {
 			// `withTimeout` only RACES the create — it cannot cancel it. A create that resolves after the
 			// timeout (or after a capacity error on a later attempt) leaves a live sandbox no one awaits, and
@@ -381,6 +400,8 @@ const SUITE_READINESS = {
 
 /** The already-resolved context {@link runSuiteOnSandbox} runs against. */
 export interface SuiteRunContext {
+	/** Opt-in isolation gate; defaults to the workflow BENCH_PLACEMENT_GATE flag. */
+	placementGate?: boolean;
 	suite: Suite;
 	suiteName: string;
 	providerName: string;
@@ -423,6 +444,14 @@ export async function runSuiteOnSandbox(
 		// nothing to do with disk. Pre-baked providers answer the first probe and pay one round-trip.
 		const readiness = await waitUntilReady(sandbox, ctx.readiness ?? SUITE_READINESS);
 		if (!readiness.ready) throw new Error(neverReadyReason(readiness.attempts));
+		if (ctx.placementGate ?? process.env.BENCH_PLACEMENT_GATE === "true") {
+			console.log(`Waiting for verified placement: ${providerName}/${suiteName}`);
+			await runner.step(
+				"wait for verified placement",
+				"date -u +%FT%TZ > /tmp/hpc-benchmark-placement-waiting; timeout 120 sh -c 'until grep -qx ready /tmp/hpc-benchmark-placement-ready 2>/dev/null; do sleep 1; done' && date -u +placement_ready=%FT%TZ",
+				3 * MIN,
+			);
+		}
 		if (suite.minDiskGb) {
 			// Measure free space where the disk-heavy suites actually write, not the sandbox root. The
 			// heavy PTS data (realworld clones/builds, pgbench cluster, fio test files, installed-tests)
