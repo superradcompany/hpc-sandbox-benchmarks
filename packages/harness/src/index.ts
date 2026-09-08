@@ -381,6 +381,8 @@ const SUITE_READINESS = {
 
 /** The already-resolved context {@link runSuiteOnSandbox} runs against. */
 export interface SuiteRunContext {
+	/** Opt-in isolation gate; defaults to the workflow BENCH_PLACEMENT_GATE flag. */
+	placementGate?: boolean;
 	suite: Suite;
 	suiteName: string;
 	providerName: string;
@@ -423,6 +425,14 @@ export async function runSuiteOnSandbox(
 		// nothing to do with disk. Pre-baked providers answer the first probe and pay one round-trip.
 		const readiness = await waitUntilReady(sandbox, ctx.readiness ?? SUITE_READINESS);
 		if (!readiness.ready) throw new Error(neverReadyReason(readiness.attempts));
+		if (ctx.placementGate ?? process.env.BENCH_PLACEMENT_GATE === "true") {
+			console.log(`Waiting for verified placement: ${providerName}/${suiteName}`);
+			await runner.step(
+				"wait for verified placement",
+				"timeout 120 sh -c 'while [ ! -f /tmp/hpc-benchmark-placement-ready ]; do sleep 1; done' && date -u +placement_ready=%FT%TZ",
+				3 * MIN,
+			);
+		}
 		if (suite.minDiskGb) {
 			// Measure free space where the disk-heavy suites actually write, not the sandbox root. The
 			// heavy PTS data (realworld clones/builds, pgbench cluster, fio test files, installed-tests)

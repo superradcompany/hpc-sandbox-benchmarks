@@ -64,6 +64,11 @@ on:
           sandbox tagged with its `--replicate <idx>` so the aggregate folds them by index.
         required: true
         type: string
+      placement_gate:
+        description: 'Require operator-confirmed placement before setup or measured work; bounded to two minutes.'
+        required: false
+        type: boolean
+        default: false
       max_concurrency:
         description: >-
           Cap on replicate sandboxes in flight per cell (BENCH_MAX_CONCURRENCY). Blank = unbounded, i.e.
@@ -217,6 +222,7 @@ jobs:
           # Blank = unbounded (all R sandboxes at once). See the max_concurrency input above: this is the
           # control for a provider whose quota is smaller than R, and it trades wall clock for peak load.
           BENCH_MAX_CONCURRENCY: ${{ inputs.max_concurrency }}
+          BENCH_PLACEMENT_GATE: ${{ inputs.placement_gate }}
           # This job's `timeout-minutes`, handed to the CLI so it can REFUSE a cap that cannot fit rather
           # than be cancelled three hours in with every shard of the cell lost. A cap runs the fan-out in
           # ceil(R / cap) serial waves, so the cell's worst case is waves x the suite's own budget — and
