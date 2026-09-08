@@ -14,7 +14,10 @@ case "$suite/$task/$config" in
   openclaw/shrinkwrap_check/openclaw-pin-candidate-v1) [ -n "$pin" ] ;;
   *) echo 'unsupported diagnostic configuration' >&2; exit 2 ;;
 esac
-root=$(mktemp -d "/tmp/hpc-diagnostic-${config}.XXXXXX")
+# Match the real benchmark workspace: guest /tmp may be a small tmpfs.
+stage_base=/var/lib/phoronix-test-suite
+mkdir -p "$stage_base"
+root=$(mktemp -d "$stage_base/hpc-diagnostic-${config}.XXXXXX")
 output="$repo/benchmark-results/diagnostic-$config"
 [ ! -e "$output" ] || { echo "diagnostic output already exists" >&2; exit 2; }
 mkdir -p "$output"
