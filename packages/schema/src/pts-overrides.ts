@@ -129,7 +129,6 @@ export const ptsOverrides: Record<string, MetricOverride> = {
 	// of language/framework, and Mastra's is the fastest of the three realworld repos to run.
 	realworld_mastra_v2_task_cold_install: {
 		dimension: "realworld",
-		headline: true,
 		label: "Mastra v2: cold install",
 	},
 	realworld_mastra_v2_task_git_clone: { dimension: "realworld", label: "Mastra v2: git clone" },
@@ -140,6 +139,7 @@ export const ptsOverrides: Record<string, MetricOverride> = {
 	// Historical Mastra v1 catalog entries remain available.
 	realworld_mastra_task_cold_install: {
 		dimension: "realworld",
+		headline: true,
 		label: "Mastra: cold install",
 	},
 	realworld_mastra_task_git_clone: { dimension: "realworld", label: "Mastra: git clone" },
