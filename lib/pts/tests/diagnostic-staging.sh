@@ -83,10 +83,10 @@ sequence=$(mktemp -d)
 (
   cd "$sequence"
   # shellcheck source=/dev/null
-source "$repo/lib/pts/realworld/diagnostic-sequence.sh"
+  source "$repo/lib/pts/realworld/diagnostic-sequence.sh"
   cat > realworld-runner.sh <<'SEQUENCE_RUNNER'
 echo invoked >> invocations
-case "$1" in slow) sleep 5 ;; *) exit 7 ;; esac
+case "$1" in slow) sleep 5 ;; passes) exit 0 ;; *) exit 7 ;; esac
 SEQUENCE_RUNNER
   code=0
   run_diagnostic_sequence "$sequence" "$SECONDS" never || code=$?
@@ -103,5 +103,9 @@ SEQUENCE_RUNNER
   grep -q '"task":"slow","exitCode":124,"started":true' task-outcomes.jsonl
   grep -q '"task":"after","exitCode":124,"started":false' task-outcomes.jsonl
   [ "$(wc -l < invocations)" = 2 ]
+  mkdir broken broken/task-outcomes.jsonl
+  code=0
+  run_diagnostic_sequence "$sequence/broken" "$((SECONDS + 10))" passes || code=$?
+  [ "$code" -ne 0 ]
 )
 printf 'sequence provenance distinguishes unstarted tasks and started failures/timeouts\n'

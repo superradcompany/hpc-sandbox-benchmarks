@@ -22,7 +22,7 @@ run_diagnostic_sequence() {
       reason=command_exit
     fi
     printf '{"task":"%s","exitCode":%s,"started":%s,"elapsedSeconds":%s,"remainingSequenceSeconds":%s,"reason":"%s"}\n' \
-      "$selected" "$code" "$started" "$elapsed" "$remaining" "$reason" >> "$root/task-outcomes.jsonl"
+      "$selected" "$code" "$started" "$elapsed" "$remaining" "$reason" >> "$root/task-outcomes.jsonl" || return $?
     if [ "$code" -ne 0 ]; then status=$code; fi
   done
   return "$status"
