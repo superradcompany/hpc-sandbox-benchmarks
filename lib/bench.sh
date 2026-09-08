@@ -648,6 +648,17 @@ run_pts_benchmark() {
 		fi
 	fi
 
+	if [ "$test_name" = "pts/fio-2.1.0" ]; then
+		# PTS's upstream parser drops GiB/s trials. Override only the parser after installation,
+		# preserving the installed binary, options, and existing MiB/s numeric convention.
+		local parser_dst
+		parser_dst="$(pts_user_dir)/test-profiles/pts/fio-2.1.0/results-definition.xml"
+		if ! cp "${REPO_ROOT}/packages/schema/src/pts-profiles/fio-2.1.0/results-definition.xml" "$parser_dst"; then
+			fail_result "could not install fio bandwidth parser" "$prefix"
+			return 1
+		fi
+	fi
+
 	# Stamp the instant before the run: the composite search below must only accept output THIS
 	# batch-run wrote. Suites now run several PTS leaves in one sandbox (fio ×4 + hardlink; pybench +
 	# sqlite + pgbench ×2), so a bare "newest composite" would, when a later batch-run produces
@@ -846,6 +857,7 @@ run_fio_pts() {
 	local direct
 	direct="$(fio_direct_choice)"
 	echo "fio scenario: Type=${type_name} Block Size=${bs_name} Direct=${direct} (O_DIRECT probe)"
+
 
 	run_pinned_pts "pts/fio-2.1.0" "$prefix" \
 		"fio.type=${type_name};fio.engine=Linux AIO;fio.direct=${direct};fio.size=${bs_name};fio.cpu-threads=0;fio.auto-disk-mount-points=Default Test Directory"
