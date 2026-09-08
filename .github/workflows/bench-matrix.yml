@@ -90,6 +90,11 @@ on:
         required: false
         type: boolean
         default: false
+      allow_overlap:
+        description: 'Allow this run alongside another run on the same branch. Use for disjoint suite batches after checking shared provider capacity.'
+        required: false
+        type: boolean
+        default: false
 
 # Least privilege, workflow default: jobs only read the checked-out code and upload artifacts (publish
 # elevates to contents: write). `id-token: write` is deliberately NOT granted here — only the `suite`
@@ -99,9 +104,9 @@ on:
 permissions:
   contents: read
 
-# Serialize matrix runs on a ref so concurrent dispatches don't contend for provider quota.
+# Serialize by default. Explicit overlap gives this run its own group without cancelling another run.
 concurrency:
-  group: bench-matrix-${{ github.ref }}
+  group: bench-matrix-${{ github.ref }}${{ inputs.allow_overlap && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: false
 
 jobs:
