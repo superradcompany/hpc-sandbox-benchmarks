@@ -91,7 +91,7 @@ on:
         type: boolean
         default: false
       placement_gate:
-        description: 'Wait up to two minutes for explicit in-guest placement readiness before any setup or benchmark work.'
+        description: 'Wait up to ten minutes for explicit in-guest placement readiness before any setup or benchmark work.'
         required: false
         type: boolean
         default: false

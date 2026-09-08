@@ -337,6 +337,9 @@ export const SUITE_NAMES = Object.keys(SUITES) as SuiteName[];
  */
 export const WORKFLOW_TIMEOUT_MARGIN_MINUTES = 15;
 
+/** Optional pre-measurement isolation wait, added to guest and per-wave budgets. */
+export const PLACEMENT_GATE_TIMEOUT_MINUTES = 10;
+
 /**
  * The comma-padded token for one suite, e.g. `cpu-node` → `,cpu-node,`. GitHub Actions `if:`
  * expressions can't split strings, so the setup job emits the planned suites as a padded list
