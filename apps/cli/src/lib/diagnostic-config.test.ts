@@ -42,6 +42,12 @@ test("only fixed configurations and diagnostic guest IDs are accepted", () => {
 	expect(() => diagnosticSandboxId("user-sandbox")).toThrow();
 	expect(() => diagnosticSandboxId("bench-cloud-diag-123-1;whoami")).toThrow();
 });
+test("versioned OpenClaw sequence uses the bounded lifecycle", () => {
+	expect(diagnosticConfig("openclaw-v2-all-fd-hard-v1")).toBe("openclaw-v2-all-fd-hard-v1");
+	const result = invoke("run", { DIAGNOSTIC_CONFIG: "openclaw-v2-all-fd-hard-v1" });
+	expect(result.code).toBe(0);
+	expect(result.calls).toContain("collect diagnostic logs\ndestroy\n");
+});
 test("create makes exactly one bounded guest and does not execute a task", () => {
 	const result = invoke("create");
 	expect(result.code).toBe(0);

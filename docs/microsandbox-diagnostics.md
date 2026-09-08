@@ -11,6 +11,7 @@ Configurations:
 
 | ID | Workload | Explicit change |
 | --- | --- | --- |
+| `openclaw-v2-all-fd-hard-v1` | All eight V2 tasks, sequentially | New upstream release and metric identities; soft FD limit raised only to existing hard limit |
 | `mastra-heap4096-worker1-v1` | Existing pinned Mastra core tests, unchanged build prep | 4096-MiB V8 heap per process and one Vitest worker |
 | `openclaw-fd-hard-v1` | Existing pinned OpenClaw unit-fast tests | Raise soft file-descriptor limit to its existing hard limit; log both |
 | `openclaw-original-diagnostic-v1` | Existing pinned OpenClaw whole-repo lint | No workload/resource parameter changes; capture failure diagnostics |
@@ -18,3 +19,5 @@ Configurations:
 The first two configurations are not silently comparable to historical timings. The existing runner retains its task cgroup cap and 1200-second per-command timeout. GNU time reports resource use; nonzero task exits retain their failure status and record cgroup OOM deltas. A positive delta is evidence of an OOM kill; exit 1 alone is not.
 
 Only logs and diagnostic configuration are collected, not dependency/work trees. No image prewarming, worker eligibility changes, autoscaler changes, or full provider matrix runs are performed by this workflow.
+
+The V2 sequence retains each task exit in `task-outcomes.jsonl`, continues after a failed task, and fails overall if any task fails. Installation is capped at 30 minutes and the complete task sequence at 50 minutes, within the lifecycle and guest TTL bounds. Tasks that cannot start before the sequence deadline are explicitly recorded with exit 124. These diagnostic timings are unscored and never replace V1 metrics.

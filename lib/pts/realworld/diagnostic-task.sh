@@ -8,6 +8,7 @@ task=$3
 config=$4
 pin=${5:-}
 case "$suite/$task/$config" in
+  openclaw-v2/all/openclaw-v2-all-fd-hard-v1) ;;
   mastra/test_core/mastra-heap4096-worker1-v1) ;;
   openclaw/test_unit_fast/openclaw-fd-hard-v1) ;;
   openclaw/lint_oxlint/openclaw-original-diagnostic-v1) ;;
@@ -25,7 +26,7 @@ mkdir -p "$output"
 # shellcheck disable=SC2329 # Called indirectly by the EXIT trap below.
 preserve_logs() {
   status=$?
-  for file in install.log task.log environment.log; do
+  for file in install.log task.log environment.log task-outcomes.jsonl; do
     if [ -f "$root/$file" ]; then cp "$root/$file" "$output/$file"; fi
   done
   if [ -f "$root/source/target.env" ]; then cp "$root/source/target.env" "$output/target.env"; fi
@@ -50,7 +51,7 @@ printf 'config=%s suite=%s task=%s artifact_dir=%s\n' "$config" "$suite" "$task"
 printf 'harness_sha=%s\n' "$(git -C "$repo" rev-parse HEAD)"
 printf 'nofile_before soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
 } | tee "$root/environment.log"
-if [ "$config" = openclaw-fd-hard-v1 ]; then ulimit -Sn "$(ulimit -Hn)"; fi
+if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi
 printf 'nofile_after soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)" | tee -a "$root/environment.log"
 # Guest remains at the normal resource spec; runner retains MemTotal-1GiB task cgroup cap.
 export HOME="$root/install"
@@ -58,9 +59,25 @@ export REALWORLD_TASK_TIMEOUT_SECONDS=1200
 export TEST_SILENT_MODE=1
 cd "$root/install"
 timeout --kill-after=30 1800 /usr/bin/time -v sh "$root/source/install.sh" > "$root/install.log" 2>&1
-set +e
-timeout --kill-after=30 3000 /usr/bin/time -v sh ./realworld-runner.sh "$task" > "$root/task.log" 2>&1
-status=$?
-set -e
+tasks=("$task")
+if [ "$config" = openclaw-v2-all-fd-hard-v1 ]; then
+  tasks=(git_clone cold_install lint_oxlint lint_extensions typecheck npm_lock_check test_unit_fast test_types)
+fi
+# Bound the complete task sequence as well as each command. Keep failed tasks visible.
+deadline=$((SECONDS + 3000))
+status=0
+for selected in "${tasks[@]}"; do
+  remaining=$((deadline - SECONDS))
+  if [ "$remaining" -le 0 ]; then
+    code=124
+  else
+    set +e
+    timeout --kill-after=30 "$remaining" /usr/bin/time -v sh ./realworld-runner.sh "$selected" >> "$root/task.log" 2>&1
+    code=$?
+    set -e
+  fi
+  printf '{"task":"%s","exitCode":%s}\n' "$selected" "$code" >> "$root/task-outcomes.jsonl"
+  if [ "$code" -ne 0 ]; then status=$code; fi
+done
 printf 'task_exit=%s artifact_dir=%s\n' "$status" "$root"
 exit "$status"
