@@ -19,6 +19,7 @@ output="$repo/benchmark-results/diagnostic-$config"
 [ ! -e "$output" ] || { echo "diagnostic output already exists" >&2; exit 2; }
 mkdir -p "$output"
 # Preserve evidence, not the multi-gigabyte dependency/work tree. The guest owns that temporary tree.
+# shellcheck disable=SC2329 # Called indirectly by the EXIT trap below.
 preserve_logs() {
   status=$?
   for file in install.log task.log environment.log; do

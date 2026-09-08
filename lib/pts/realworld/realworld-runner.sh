@@ -164,7 +164,9 @@ run_bounded() {
 	if [ "$status" -ne 0 ]; then
 		# A child OOM can be wrapped as exit 1 by pnpm/node. Capture the cgroup verdict on every
 		# failure, not only an outer SIGKILL, without changing the command or its exit status.
-		echo "task '${TASK}' failed (exit ${status}); nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)" >&2
+		echo "task '${TASK}' failed (exit ${status})" >&2
+		# Query inherited limits through bash: POSIX sh does not specify ulimit -S/-H.
+		bash -c 'printf "nofile soft=%s hard=%s\n" "$(ulimit -Sn)" "$(ulimit -Hn)"' >&2
 		for metric in memory.events memory.current memory.peak; do
 			if [ -n "${BENCH_CG:-}" ] && [ -f "$BENCH_CG/$metric" ]; then
 				sed "s/^/bench-cgroup: $metric /" "$BENCH_CG/$metric" >&2 2>/dev/null || true

@@ -19,9 +19,8 @@ permissions:
 jobs:
   check:
     name: Lint, typecheck, test & spell
-    runs-on: starsling-ubuntu-24.04-2
-    # The runner is self-hosted, so never execute untrusted fork-PR code on it: run only for
-    # pushes and pull requests whose head is this same repository (fork PRs are skipped).
+    runs-on: ubuntu-24.04
+    # Retain the existing same-repository PR policy while using disposable hosted runners.
     if: >-
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
