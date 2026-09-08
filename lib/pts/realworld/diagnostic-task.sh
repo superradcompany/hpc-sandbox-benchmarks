@@ -8,7 +8,7 @@ task=$3
 config=$4
 pin=${5:-}
 case "$suite/$task/$config" in
-  openclaw-v2/all/openclaw-v2-all-fd-hard-v1) ;;
+  openclaw-v2/all/openclaw-v2-all-fd-hard-v1|openclaw-v2/test_types/openclaw-v2-test-types-go2g-v1) ;;
   mastra/test_core/mastra-heap4096-worker1-v1) ;;
   openclaw/test_unit_fast/openclaw-fd-hard-v1) ;;
   openclaw/lint_oxlint/openclaw-original-diagnostic-v1) ;;
@@ -24,9 +24,14 @@ output="$repo/benchmark-results/diagnostic-$config"
 mkdir -p "$output"
 # Preserve evidence, not the multi-gigabyte dependency/work tree. The guest owns that temporary tree.
 # shellcheck disable=SC2329 # Called indirectly by the EXIT trap below.
+compiler_sampler_pid=
 preserve_logs() {
   status=$?
-  for file in install.log task.log environment.log task-outcomes.jsonl; do
+  if [ -n "$compiler_sampler_pid" ]; then
+    kill "$compiler_sampler_pid" 2>/dev/null || true
+    wait "$compiler_sampler_pid" 2>/dev/null || true
+  fi
+  for file in install.log task.log environment.log task-outcomes.jsonl compiler-samples.jsonl; do
     if [ -f "$root/$file" ]; then cp "$root/$file" "$output/$file"; fi
   done
   if [ -f "$root/source/target.env" ]; then cp "$root/source/target.env" "$output/target.env"; fi
@@ -36,6 +41,11 @@ trap preserve_logs EXIT
 mkdir "$root/source" "$root/install"
 cp "$repo/lib/pts/realworld/"{install.sh,realworld-runner.sh} "$root/source/"
 cp "$repo/packages/schema/src/pts-profiles/local/realworld-${suite}-1.0.0/target.env" "$root/source/"
+if [ "$config" = openclaw-v2-test-types-go2g-v1 ]; then
+  cat >> "$root/source/target.env" <<'ENV'
+TASK_CMD_test_types="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled GOMEMLIMIT=2GiB GOGC=10 GOMAXPROCS=1 pnpm check:test-types"
+ENV
+fi
 if [ -n "$pin" ]; then
   [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || exit 2
   printf '\nPIN_SHA="%s"\n' "$pin" >> "$root/source/target.env"
@@ -51,7 +61,7 @@ printf 'config=%s suite=%s task=%s artifact_dir=%s\n' "$config" "$suite" "$task"
 printf 'harness_sha=%s\n' "$(git -C "$repo" rev-parse HEAD)"
 printf 'nofile_before soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
 } | tee "$root/environment.log"
-if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi
+if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-test-types-go2g-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi
 printf 'nofile_after soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)" | tee -a "$root/environment.log"
 # Guest remains at the normal resource spec; runner retains MemTotal-1GiB task cgroup cap.
 export HOME="$root/install"
@@ -59,6 +69,10 @@ export REALWORLD_TASK_TIMEOUT_SECONDS=1200
 export TEST_SILENT_MODE=1
 cd "$root/install"
 timeout --kill-after=30 1800 /usr/bin/time -v sh "$root/source/install.sh" > "$root/install.log" 2>&1
+if [ "$config" = openclaw-v2-test-types-go2g-v1 ]; then
+  node "$repo/lib/pts/realworld/compiler-sampler.mjs" "$root/compiler-samples.jsonl" &
+  compiler_sampler_pid=$!
+fi
 tasks=("$task")
 if [ "$config" = openclaw-v2-all-fd-hard-v1 ]; then
   tasks=(git_clone cold_install lint_oxlint lint_extensions typecheck npm_lock_check test_unit_fast test_types)

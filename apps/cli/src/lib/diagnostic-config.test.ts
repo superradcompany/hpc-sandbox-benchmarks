@@ -48,6 +48,11 @@ test("versioned OpenClaw sequence uses the bounded lifecycle", () => {
 	expect(result.code).toBe(0);
 	expect(result.calls).toContain("collect diagnostic logs\ndestroy\n");
 });
+test("bounded test-type compiler probe uses the normal lifecycle", () => {
+	const result = invoke("run", { DIAGNOSTIC_CONFIG: "openclaw-v2-test-types-go2g-v1" });
+	expect(result.code).toBe(0);
+	expect(result.calls).toContain("collect diagnostic logs\ndestroy\n");
+});
 test("create makes exactly one bounded guest and does not execute a task", () => {
 	const result = invoke("create");
 	expect(result.code).toBe(0);
