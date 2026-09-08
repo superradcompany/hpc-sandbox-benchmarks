@@ -12,6 +12,7 @@ Configurations:
 | ID | Workload | Explicit change |
 | --- | --- | --- |
 | `openclaw-v2-test-types-go2g-v1` | Complete existing V2 test-types command | Explicit Go memory target2GiB, GOGC10, GOMAXPROCS1, upstream throttled compiler policy; diagnostic-only compiler sampling |
+| `openclaw-v2-all-throttled-fd-v1` | All eight V2 tasks, sequentially | Same FD policy; bounded native compilers, full extension chunks, and one unit-fast worker |
 | `openclaw-v2-all-fd-hard-v1` | All eight V2 tasks, sequentially | New upstream release and metric identities; soft FD limit raised only to existing hard limit |
 | `mastra-heap4096-worker1-v1` | Existing pinned Mastra core tests, unchanged build prep | 4096-MiB V8 heap per process and one Vitest worker |
 | `openclaw-fd-hard-v1` | Existing pinned OpenClaw unit-fast tests | Raise soft file-descriptor limit to its existing hard limit; log both |

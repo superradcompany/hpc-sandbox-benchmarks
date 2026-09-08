@@ -11,7 +11,7 @@ on:
         description: 'Explicit diagnostic configuration; results are not published benchmark samples.'
         type: choice
         required: true
-        options: [openclaw-v2-test-types-go2g-v1, openclaw-v2-all-fd-hard-v1, mastra-heap4096-worker1-v1, openclaw-fd-hard-v1, openclaw-original-diagnostic-v1]
+        options: [openclaw-v2-all-throttled-fd-v1, openclaw-v2-test-types-go2g-v1, openclaw-v2-all-fd-hard-v1, mastra-heap4096-worker1-v1, openclaw-fd-hard-v1, openclaw-original-diagnostic-v1]
       sandbox_id:
         description: 'Previously created diagnostic guest ID; required for run/cleanup.'
         type: string
