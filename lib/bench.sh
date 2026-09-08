@@ -858,7 +858,6 @@ run_fio_pts() {
 	direct="$(fio_direct_choice)"
 	echo "fio scenario: Type=${type_name} Block Size=${bs_name} Direct=${direct} (O_DIRECT probe)"
 
-
 	run_pinned_pts "pts/fio-2.1.0" "$prefix" \
 		"fio.type=${type_name};fio.engine=Linux AIO;fio.direct=${direct};fio.size=${bs_name};fio.cpu-threads=0;fio.auto-disk-mount-points=Default Test Directory"
 }
