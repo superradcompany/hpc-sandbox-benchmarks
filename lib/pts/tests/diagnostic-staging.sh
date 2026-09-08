@@ -6,6 +6,7 @@ repo=${1:?harness repository path required}
 fixture=$(mktemp -d)
 mkdir -p "$fixture/lib/pts/realworld" "$fixture/packages/schema/src/pts-profiles/local/realworld-mastra-1.0.0"
 printf 'PIN_SHA=fixture\n' > "$fixture/packages/schema/src/pts-profiles/local/realworld-mastra-1.0.0/target.env"
+cp "$repo/lib/pts/realworld/diagnostic-sequence.sh" "$fixture/lib/pts/realworld/"
 cat > "$fixture/lib/pts/realworld/install.sh" <<'INSTALL'
 set -eu
 case "$PWD" in /var/lib/phoronix-test-suite/*) ;; *) echo 'wrong filesystem' >&2; exit 88 ;; esac
@@ -77,3 +78,30 @@ out="$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd16384-v1"
 [ "$(wc -l < "$out/task-outcomes.jsonl")" = 8 ]
 grep -q 'nofile_after soft=16384 hard=16384' "$out/environment.log"
 printf 'explicit nofile candidate rejects wrong limits and preserves all eight tasks\n'
+
+sequence=$(mktemp -d)
+(
+  cd "$sequence"
+  # shellcheck source=/dev/null
+source "$repo/lib/pts/realworld/diagnostic-sequence.sh"
+  cat > realworld-runner.sh <<'SEQUENCE_RUNNER'
+echo invoked >> invocations
+case "$1" in slow) sleep 5 ;; *) exit 7 ;; esac
+SEQUENCE_RUNNER
+  code=0
+  run_diagnostic_sequence "$sequence" "$SECONDS" never || code=$?
+  [ "$code" = 124 ] && [ ! -f invocations ]
+  grep -q '"task":"never","exitCode":124,"started":false,"elapsedSeconds":0' task-outcomes.jsonl
+  grep -q '"reason":"sequence_budget_exhausted"' task-outcomes.jsonl
+  code=0
+  run_diagnostic_sequence "$sequence" "$((SECONDS + 10))" fails || code=$?
+  [ "$code" = 7 ]
+  grep -q '"task":"fails","exitCode":7,"started":true' task-outcomes.jsonl
+  code=0
+  run_diagnostic_sequence "$sequence" "$((SECONDS + 1))" slow after || code=$?
+  [ "$code" = 124 ]
+  grep -q '"task":"slow","exitCode":124,"started":true' task-outcomes.jsonl
+  grep -q '"task":"after","exitCode":124,"started":false' task-outcomes.jsonl
+  [ "$(wc -l < invocations)" = 2 ]
+)
+printf 'sequence provenance distinguishes unstarted tasks and started failures/timeouts\n'

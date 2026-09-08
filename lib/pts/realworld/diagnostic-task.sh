@@ -86,19 +86,9 @@ if [[ "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-all-thro
 fi
 # Bound the complete task sequence as well as each command. Keep failed tasks visible.
 deadline=$((SECONDS + 3000))
+# shellcheck source=/dev/null
+source "$repo/lib/pts/realworld/diagnostic-sequence.sh"
 status=0
-for selected in "${tasks[@]}"; do
-  remaining=$((deadline - SECONDS))
-  if [ "$remaining" -le 0 ]; then
-    code=124
-  else
-    set +e
-    timeout --kill-after=30 "$remaining" /usr/bin/time -v sh ./realworld-runner.sh "$selected" >> "$root/task.log" 2>&1
-    code=$?
-    set -e
-  fi
-  printf '{"task":"%s","exitCode":%s}\n' "$selected" "$code" >> "$root/task-outcomes.jsonl"
-  if [ "$code" -ne 0 ]; then status=$code; fi
-done
+run_diagnostic_sequence "$root" "$deadline" "${tasks[@]}" || status=$?
 printf 'task_exit=%s artifact_dir=%s\n' "$status" "$root"
 exit "$status"
