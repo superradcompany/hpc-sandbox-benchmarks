@@ -13,7 +13,7 @@ it("compiler diagnostics emit only allowed environment keys and selected resourc
 		for (const [pid, command] of [
 			["123", "tsgo"],
 			["456", "node"],
-		]) {
+		] as const) {
 			mkdirSync(join(root, pid, "fd"), { recursive: true });
 			writeFileSync(join(root, pid, "comm"), `${command}\n`);
 			writeFileSync(
