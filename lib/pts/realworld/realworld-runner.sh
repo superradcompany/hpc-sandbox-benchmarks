@@ -15,6 +15,13 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "${SCRIPT_DIR}/target.env"
 
+# PTS sets HOME to the profile install directory with a trailing slash. Node preserves it in
+# os.homedir(), so Mastra's path.replace(home, "~") produces "~file" instead of "~/file".
+# Keep the same directory, stripping only trailing separators (and preserving filesystem root).
+while [ "${HOME%/}" != "$HOME" ] && [ "$HOME" != / ]; do
+	export HOME="${HOME%/}"
+done
+
 WORK_DIR="${SCRIPT_DIR}/work"
 
 # Fixed env, never ambient-HOME-dependent, so PTS's env quirks (it runs tests under varying HOME
