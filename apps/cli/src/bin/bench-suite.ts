@@ -19,6 +19,7 @@ import {
 	requiredProviders,
 	runSuite,
 	SuiteUsageError,
+	suiteLifetimeMinutes,
 	unmetRequirements,
 } from "@sandbox-benchmarks/harness";
 import { writeNormalizedRun } from "@sandbox-benchmarks/results";
@@ -642,7 +643,8 @@ if (import.meta.main) {
 	// alongside the other malformed-axis guards and before a single sandbox exists. An unregistered
 	// suite is left alone: `describeSuiteTasks` below owns that error, and guessing a budget for a suite
 	// with no declared one would report the wrong problem.
-	const suiteBudget = suite in SUITES ? SUITES[suite as SuiteName].timeoutMinutes : undefined;
+	const suiteBudget =
+		suite in SUITES ? suiteLifetimeMinutes(SUITES[suite as SuiteName]) : undefined;
 	if (replicateIndices && cellBudgetMinutes !== undefined && suiteBudget !== undefined) {
 		const budgetError = fleetBudgetError({
 			replicates: replicateIndices.length,

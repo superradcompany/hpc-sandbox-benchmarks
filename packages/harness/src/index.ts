@@ -4,7 +4,12 @@ import { resolve } from "node:path";
 import type { DirectProvider, ProviderConfig } from "@sandbox-benchmarks/providers";
 import { providers } from "@sandbox-benchmarks/providers";
 import type { ProviderTransport, RawRun, ResultGap, Suite } from "@sandbox-benchmarks/schema";
-import { HARNESS_METRIC_IDS, isPtsResultFile, SUITES } from "@sandbox-benchmarks/schema";
+import {
+	HARNESS_METRIC_IDS,
+	isPtsResultFile,
+	PLACEMENT_GATE_TIMEOUT_MINUTES,
+	SUITES,
+} from "@sandbox-benchmarks/schema";
 import { collectResults, writeGapMarker } from "./lib/collect.ts";
 import type { SandboxHandle } from "./lib/execute.ts";
 import { MIN, resolvePtsPassPolicy, StepRunner, withTimeout } from "./lib/execute.ts";
@@ -279,6 +284,14 @@ export interface CreateSuiteSandboxContext {
 	createTimeoutMs?: number;
 }
 
+/** Include optional isolation waiting without consuming the suite's execution lifetime. */
+export function suiteLifetimeMinutes(
+	suite: Pick<Suite, "timeoutMinutes">,
+	placementGate = process.env.BENCH_PLACEMENT_GATE === "true",
+): number {
+	return suite.timeoutMinutes + (placementGate ? PLACEMENT_GATE_TIMEOUT_MINUTES : 0);
+}
+
 /**
  * Create the sandbox a suite will run on, retrying patiently through capacity errors. Any error that
  * ESCAPES — a factory (adapter-construction) throw, a non-capacity create failure, the per-attempt
@@ -294,6 +307,7 @@ export interface CreateSuiteSandboxContext {
  * computesdk provider can throw before `sandbox.create`, and that throw must be recorded too. The
  * factory is cheap and idempotent, so re-invoking it per capacity retry is harmless.
  */
+
 export async function createSuiteSandbox(
 	computeFactory: () => SuiteSandboxCompute,
 	ctx: CreateSuiteSandboxContext,
@@ -322,7 +336,7 @@ export async function createSuiteSandbox(
 							}
 						: {}),
 					// Ask for a sandbox lifetime covering setup + the suite, where supported.
-					timeout: suite.timeoutMinutes * MIN,
+					timeout: suiteLifetimeMinutes(suite) * MIN,
 				}),
 			);
 			const sandbox = await withTimeout(
@@ -448,8 +462,8 @@ export async function runSuiteOnSandbox(
 			console.log(`Waiting for verified placement: ${providerName}/${suiteName}`);
 			await runner.step(
 				"wait for verified placement",
-				"date -u +%FT%TZ > /tmp/hpc-benchmark-placement-waiting; timeout 120 sh -c 'until grep -qx ready /tmp/hpc-benchmark-placement-ready 2>/dev/null; do sleep 1; done' && date -u +placement_ready=%FT%TZ",
-				3 * MIN,
+				`date -u +%FT%TZ > /tmp/hpc-benchmark-placement-waiting; timeout ${PLACEMENT_GATE_TIMEOUT_MINUTES * 60} sh -c 'until grep -qx ready /tmp/hpc-benchmark-placement-ready 2>/dev/null; do sleep 1; done' && date -u +placement_ready=%FT%TZ`,
+				(PLACEMENT_GATE_TIMEOUT_MINUTES + 1) * MIN,
 			);
 		}
 		if (suite.minDiskGb) {

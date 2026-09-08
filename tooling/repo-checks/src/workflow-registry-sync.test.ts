@@ -14,7 +14,12 @@
 // `bun test`, same precedent as boundary.test.ts); the rest is unit coverage of the parsers and the
 // failure messages on synthetic drift, so a future regression names the offending file + key.
 import { describe, expect, test } from "bun:test";
-import { PROVIDERS, SUITE_NAMES } from "@sandbox-benchmarks/schema";
+import {
+	PLACEMENT_GATE_TIMEOUT_MINUTES,
+	PROVIDERS,
+	SUITE_NAMES,
+	SUITES,
+} from "@sandbox-benchmarks/schema";
 import {
 	CELL_BUDGET_ENV_KEY,
 	checkCellBudgetEnv,
@@ -79,6 +84,13 @@ describe("parsers against the real workflow files", () => {
 	test("both live-run jobs reserve host margin beyond the longest suite", () => {
 		expect(jobTimeoutMinutes(smoke, SMOKE_JOB, SMOKE_WORKFLOW)).toBe(180);
 		expect(jobTimeoutMinutes(suiteWf, SUITE_JOB, SUITE_WORKFLOW)).toBe(180);
+	});
+
+	test("matrix job also covers the complete optional isolation wait", () => {
+		const longest = Math.max(...Object.values(SUITES).map((suite) => suite.timeoutMinutes));
+		expect(jobTimeoutMinutes(suiteWf, SUITE_JOB, SUITE_WORKFLOW)).toBeGreaterThanOrEqual(
+			longest + PLACEMENT_GATE_TIMEOUT_MINUTES + WORKFLOW_TIMEOUT_MARGIN_MINUTES,
+		);
 	});
 
 	test("dispatchInput throws on a missing input instead of passing vacuously", () => {

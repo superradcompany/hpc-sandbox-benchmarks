@@ -14,6 +14,7 @@ import {
 	runSuite,
 	runSuiteOnSandbox,
 	SuiteUsageError,
+	suiteLifetimeMinutes,
 	timeOperation,
 	unmetRequirements,
 	withSandbox,
@@ -524,6 +525,11 @@ describe("createSuiteSandbox (creation-failure marker)", () => {
 	});
 });
 
+it("isolation budget is additional and default guest lifetime is unchanged", () => {
+	expect(suiteLifetimeMinutes({ timeoutMinutes: 85 }, false)).toBe(85);
+	expect(suiteLifetimeMinutes({ timeoutMinutes: 85 }, true)).toBe(95);
+});
+
 it("gated creation tags the workflow and suite for live allocation lookup", async () => {
 	const oldGate = process.env.BENCH_PLACEMENT_GATE;
 	const oldRun = process.env.GITHUB_RUN_ID;
@@ -543,6 +549,7 @@ it("gated creation tags the workflow and suite for live allocation lookup", asyn
 			ctx(suite({}), freshDir()),
 		);
 		expect(options).toMatchObject({
+			timeout: (suite({}).timeoutMinutes + 10) * 60_000,
 			metadata: {
 				benchmark_run_id: "34123456789",
 				benchmark_suite: "cpu-node",
@@ -572,6 +579,7 @@ describe("runSuiteOnSandbox (orchestration + teardown)", () => {
 		if (fails) await expect(result).rejects.toThrow(/placement/);
 		else await result;
 		expect(steps[0]).toContain("hpc-benchmark-placement-ready");
+		expect(steps[0]).toContain("timeout 600");
 		expect(steps.some((step) => step.includes("benchmark-cmd"))).toBe(!fails);
 		expect(destroyed.hit).toBe(true);
 	});
