@@ -65,3 +65,15 @@ for task in git_clone cold_install lint_oxlint lint_extensions typecheck npm_loc
   grep -q "\"task\":\"$task\",\"exitCode\":7" "$out/task-outcomes.jsonl"
 done
 printf 'throttled candidate preserves all eight tasks and exact command overrides\n'
+
+code=0
+(ulimit -Sn 4096; ulimit -Hn 4096; bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 all openclaw-v2-all-throttled-fd16384-v1) || code=$?
+[ "$code" = 1 ]
+mv "$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd16384-v1" "$fixture/benchmark-results/rejected-nofile4096"
+code=0
+(ulimit -Sn 16384; ulimit -Hn 16384; bash "$repo/lib/pts/realworld/diagnostic-task.sh" "$fixture" openclaw-v2 all openclaw-v2-all-throttled-fd16384-v1) || code=$?
+[ "$code" = 7 ]
+out="$fixture/benchmark-results/diagnostic-openclaw-v2-all-throttled-fd16384-v1"
+[ "$(wc -l < "$out/task-outcomes.jsonl")" = 8 ]
+grep -q 'nofile_after soft=16384 hard=16384' "$out/environment.log"
+printf 'explicit nofile candidate rejects wrong limits and preserves all eight tasks\n'

@@ -8,7 +8,7 @@ task=$3
 config=$4
 pin=${5:-}
 case "$suite/$task/$config" in
-  openclaw-v2/all/openclaw-v2-all-fd-hard-v1|openclaw-v2/test_types/openclaw-v2-test-types-go2g-v1|openclaw-v2/all/openclaw-v2-all-throttled-fd-v1) ;;
+  openclaw-v2/all/openclaw-v2-all-fd-hard-v1|openclaw-v2/test_types/openclaw-v2-test-types-go2g-v1|openclaw-v2/all/openclaw-v2-all-throttled-fd-v1|openclaw-v2/all/openclaw-v2-all-throttled-fd16384-v1) ;;
   mastra/test_core/mastra-heap4096-worker1-v1) ;;
   openclaw/test_unit_fast/openclaw-fd-hard-v1) ;;
   openclaw/lint_oxlint/openclaw-original-diagnostic-v1) ;;
@@ -46,7 +46,7 @@ if [ "$config" = openclaw-v2-test-types-go2g-v1 ]; then
 TASK_CMD_test_types="OPENCLAW_LOCAL_CHECK=1 OPENCLAW_LOCAL_CHECK_MODE=throttled GOMEMLIMIT=2GiB GOGC=10 GOMAXPROCS=1 pnpm check:test-types"
 ENV
 fi
-if [ "$config" = openclaw-v2-all-throttled-fd-v1 ]; then
+if [[ "$config" = openclaw-v2-all-throttled-fd-v1 || "$config" = openclaw-v2-all-throttled-fd16384-v1 ]]; then
   cat "$repo/lib/pts/realworld/openclaw-v2-throttled.env" >> "$root/source/target.env"
 fi
 if [ -n "$pin" ]; then
@@ -65,7 +65,10 @@ printf 'harness_sha=%s\n' "$(git -C "$repo" rev-parse HEAD)"
 printf 'node_version=%s\n' "$(node --version)"
 printf 'nofile_before soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)"
 } | tee "$root/environment.log"
-if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-test-types-go2g-v1 || "$config" = openclaw-v2-all-throttled-fd-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi
+if [[ "$config" = openclaw-fd-hard-v1 || "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-test-types-go2g-v1 || "$config" = openclaw-v2-all-throttled-fd-v1 || "$config" = openclaw-v2-all-throttled-fd16384-v1 ]]; then ulimit -Sn "$(ulimit -Hn)"; fi
+if [[ "$config" = openclaw-v2-all-throttled-fd16384-v1 ]]; then
+  [ "$(ulimit -Sn)" = 16384 ] && [ "$(ulimit -Hn)" = 16384 ] || { echo "requested nofile16384 was not applied" >&2; exit 1; }
+fi
 printf 'nofile_after soft=%s hard=%s\n' "$(ulimit -Sn)" "$(ulimit -Hn)" | tee -a "$root/environment.log"
 # Guest remains at the normal resource spec; runner retains MemTotal-1GiB task cgroup cap.
 export HOME="$root/install"
@@ -78,7 +81,7 @@ if [ "$config" = openclaw-v2-test-types-go2g-v1 ]; then
   compiler_sampler_pid=$!
 fi
 tasks=("$task")
-if [[ "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-all-throttled-fd-v1 ]]; then
+if [[ "$config" = openclaw-v2-all-fd-hard-v1 || "$config" = openclaw-v2-all-throttled-fd-v1 || "$config" = openclaw-v2-all-throttled-fd16384-v1 ]]; then
   tasks=(git_clone cold_install lint_oxlint lint_extensions typecheck npm_lock_check test_unit_fast test_types)
 fi
 # Bound the complete task sequence as well as each command. Keep failed tasks visible.

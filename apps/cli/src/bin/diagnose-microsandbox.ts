@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 import { mkdirSync, writeFileSync } from "node:fs";
 import { DIR, StepRunner, setupSteps } from "@sandbox-benchmarks/harness";
-import { providers } from "@sandbox-benchmarks/providers";
+import { createMicrosandboxCloudCompute, providers } from "@sandbox-benchmarks/providers";
 import { SUITES } from "@sandbox-benchmarks/schema";
 import {
 	DIAGNOSTICS,
 	diagnosticConfig,
 	diagnosticNodeVersion,
+	diagnosticNofile,
 	diagnosticSandboxId,
 } from "../lib/diagnostic-config.ts";
 
@@ -21,7 +22,9 @@ const name = diagnosticSandboxId(
 );
 const provider = providers.find((p) => p.name === "microsandbox-cloud");
 if (!provider) throw new Error("Provider unavailable");
-const compute = provider.createCompute();
+const nofile = diagnosticNofile(config);
+const compute =
+	nofile === undefined ? provider.createCompute() : createMicrosandboxCloudCompute(nofile);
 const output = "diagnostic-results";
 mkdirSync(output, { recursive: true });
 const manifest = {
@@ -29,7 +32,12 @@ const manifest = {
 	config,
 	name,
 	harnessSha: process.env.GITHUB_SHA,
-	requested: { vcpus: 4, memoryMiB: 8192, rootDiskMiB: 40960 },
+	requested: {
+		vcpus: 4,
+		memoryMiB: 8192,
+		rootDiskMiB: 40960,
+		...(nofile === undefined ? {} : { nofileSoft: nofile, nofileHard: nofile }),
+	},
 	status: "pending",
 };
 const save = (status: string) => {

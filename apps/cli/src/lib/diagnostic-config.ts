@@ -1,4 +1,5 @@
 export const DIAGNOSTICS = {
+	"openclaw-v2-all-throttled-fd16384-v1": ["openclaw-v2", "all"],
 	"openclaw-v2-test-types-go2g-v1": ["openclaw-v2", "test_types"],
 	"openclaw-v2-all-throttled-fd-v1": ["openclaw-v2", "all"],
 	"openclaw-v2-all-fd-hard-v1": ["openclaw-v2", "all"],
@@ -18,5 +19,12 @@ export function diagnosticSandboxId(value: string): string {
 }
 
 export function diagnosticNodeVersion(value: Diagnostic): "24.16.0" | undefined {
-	return value === "openclaw-v2-all-throttled-fd-v1" ? "24.16.0" : undefined;
+	return value === "openclaw-v2-all-throttled-fd-v1" ||
+		value === "openclaw-v2-all-throttled-fd16384-v1"
+		? "24.16.0"
+		: undefined;
+}
+
+export function diagnosticNofile(value: Diagnostic): 16384 | undefined {
+	return value === "openclaw-v2-all-throttled-fd16384-v1" ? 16384 : undefined;
 }

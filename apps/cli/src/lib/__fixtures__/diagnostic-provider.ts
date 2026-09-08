@@ -15,25 +15,30 @@ const sandbox = {
 		record("destroy");
 	},
 };
+const createCompute = () => ({
+	sandbox: {
+		list: async () => (process.env.EXISTING_GUEST ? [sandbox] : []),
+		create: async (options: { name: string; timeout: number }) => {
+			record(`create:${options.name}:${options.timeout}`);
+			return sandbox;
+		},
+		getById: async () => sandbox,
+		destroy: async () => {
+			record("destroyById");
+		},
+	},
+});
 mock.module("@sandbox-benchmarks/providers", () => ({
+	createMicrosandboxCloudCompute: (nofile: number) => {
+		record(`requestedNofile:${nofile}`);
+		return createCompute();
+	},
 	providers: [
 		{
 			name: "microsandbox-cloud",
 			transport: {},
 			createOptions: {},
-			createCompute: () => ({
-				sandbox: {
-					list: async () => (process.env.EXISTING_GUEST ? [sandbox] : []),
-					create: async (options: { name: string; timeout: number }) => {
-						record(`create:${options.name}:${options.timeout}`);
-						return sandbox;
-					},
-					getById: async () => sandbox,
-					destroy: async () => {
-						record("destroyById");
-					},
-				},
-			}),
+			createCompute,
 		},
 	],
 }));

@@ -40,9 +40,10 @@ function failedBuilder(name: string): ReturnType<typeof MsbSandbox.builder> {
 	return builder as unknown as ReturnType<typeof MsbSandbox.builder>;
 }
 
-function cloudProvider() {
+function cloudProvider(nofile?: 16384) {
 	return microsandboxCloudCompute({
 		variant: "microsandbox-cloud",
+		nofile,
 		backend: { kind: "cloud", apiKey: "offline-test-key" },
 		ephemeral: true,
 		image: "alpine:3.20",
@@ -202,7 +203,11 @@ describe("Microsandbox provider edge cases", () => {
 		return spy;
 	}
 
-	it("uses the per-create timeout as the native sandbox lifetime", async () => {
+	it.each([
+		undefined,
+		16384,
+	] as const)("preserves lifetime and applies only explicit nofile: %s", async (nofile) => {
+		let rlimitArgs: unknown[] | undefined;
 		let maxDurationSecs = 0;
 		let ephemeral: boolean | undefined;
 		let builder: Record<PropertyKey, unknown>;
@@ -210,6 +215,11 @@ describe("Microsandbox provider edge cases", () => {
 			{},
 			{
 				get: (_target, property) => {
+					if (property === "rlimitRange")
+						return (...args: unknown[]) => {
+							rlimitArgs = args;
+							return builder;
+						};
 					if (property === "maxDuration") {
 						return (seconds: number) => {
 							maxDurationSecs = seconds;
@@ -244,7 +254,8 @@ describe("Microsandbox provider edge cases", () => {
 			),
 		);
 
-		const sandbox = await cloudProvider().sandbox.create({ timeout: 12_345 });
+		const sandbox = await cloudProvider(nofile).sandbox.create({ timeout: 12_345 });
+		expect(rlimitArgs).toEqual(nofile === undefined ? undefined : ["nofile", 16384, 16384]);
 
 		expect(maxDurationSecs).toBe(13);
 		expect(ephemeral).toBe(true);

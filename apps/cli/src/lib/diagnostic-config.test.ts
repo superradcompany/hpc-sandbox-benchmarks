@@ -84,3 +84,14 @@ test("ownership mismatch neither executes nor deletes a guest", () => {
 	expect(result.code).toBe(1);
 	expect(result.calls).toBe("");
 });
+
+test("fd16384 candidate requests native limits and Node24 without changing default", () => {
+	const configuration = "openclaw-v2-all-throttled-fd16384-v1";
+	expect(diagnosticConfig(configuration)).toBe(configuration);
+	const created = invoke("create", { DIAGNOSTIC_CONFIG: configuration });
+	expect(created.code).toBe(0);
+	expect(created.calls).toBe("requestedNofile:16384\ncreate:bench-cloud-diag-123-1:7200000\n");
+	const ran = invoke("run", { DIAGNOSTIC_CONFIG: configuration });
+	expect(ran.code).toBe(0);
+	expect(ran.calls).toContain("setupNodeVersion:24.16.0");
+});

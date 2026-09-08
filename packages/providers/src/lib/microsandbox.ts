@@ -51,6 +51,8 @@ interface MicrosandboxBaseConfig {
 	cpus: number;
 	/** Guest memory in MiB. */
 	memoryMib: number;
+	/** Explicit guest soft/hard nofile limit; omitted preserves runtime defaults. */
+	nofile?: 16384;
 	/** Writable managed root disk in MiB. */
 	rootDiskMib: number;
 	/** Prefix for generated sandbox names. */
@@ -417,6 +419,8 @@ const sandboxMethods: SandboxMethods<MicrosandboxHandle, MicrosandboxConfig> = {
 					.detached(true)
 					.ephemeral(config.ephemeral)
 					.label(LABEL_MARKER, config.variant);
+				if (config.nofile !== undefined)
+					builder = builder.rlimitRange("nofile", config.nofile, config.nofile);
 				for (const [key, value] of Object.entries(metadata)) {
 					builder = builder.label(`${LABEL_META_PREFIX}${key}`, String(value));
 				}
