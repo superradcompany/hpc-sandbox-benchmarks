@@ -18,8 +18,8 @@ import {
 	CREATE_FAILURE_PREFIX,
 	requiredProviders,
 	runSuite,
-	suiteLifetimeMinutes,
 	SuiteUsageError,
+	suiteLifetimeMinutes,
 	unmetRequirements,
 } from "@sandbox-benchmarks/harness";
 import { writeNormalizedRun } from "@sandbox-benchmarks/results";
