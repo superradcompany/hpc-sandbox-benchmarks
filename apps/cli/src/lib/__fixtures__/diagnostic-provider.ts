@@ -8,7 +8,7 @@ const sandbox = {
 	getInfo: async () => ({
 		metadata: {
 			diagnostic: process.env.FOREIGN_GUEST ? "other" : "v1",
-			config: "mastra-heap4096-worker1-v1",
+			config: process.env.DIAGNOSTIC_CONFIG,
 		},
 	}),
 	destroy: async () => {

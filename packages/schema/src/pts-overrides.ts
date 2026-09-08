@@ -198,4 +198,34 @@ export const ptsOverrides: Record<string, MetricOverride> = {
 		dimension: "realworld",
 		label: "OpenClaw: typecheck (test tree)",
 	},
+
+	realworld_openclaw_v2_task_git_clone: { dimension: "realworld", label: "OpenClaw v2: git clone" },
+	realworld_openclaw_v2_task_cold_install: {
+		dimension: "realworld",
+		label: "OpenClaw v2: cold install",
+	},
+	realworld_openclaw_v2_task_lint_oxlint: {
+		dimension: "realworld",
+		label: "OpenClaw v2: lint (Oxlint)",
+	},
+	realworld_openclaw_v2_task_lint_extensions: {
+		dimension: "realworld",
+		label: "OpenClaw v2: lint (extensions)",
+	},
+	realworld_openclaw_v2_task_typecheck: {
+		dimension: "realworld",
+		label: "OpenClaw v2: typecheck (tsgo)",
+	},
+	realworld_openclaw_v2_task_npm_package_lock_check: {
+		dimension: "realworld",
+		label: "OpenClaw v2: npm package lock check",
+	},
+	realworld_openclaw_v2_task_test_unit_fast: {
+		dimension: "realworld",
+		label: "OpenClaw v2: test (unit, fast)",
+	},
+	realworld_openclaw_v2_task_test_types: {
+		dimension: "realworld",
+		label: "OpenClaw v2: typecheck (test tree)",
+	},
 };

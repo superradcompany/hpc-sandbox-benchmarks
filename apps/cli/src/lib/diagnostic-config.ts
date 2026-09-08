@@ -1,4 +1,5 @@
 export const DIAGNOSTICS = {
+	"openclaw-v2-all-fd-hard-v1": ["openclaw-v2", "all"],
 	"mastra-heap4096-worker1-v1": ["mastra", "test_core"],
 	"openclaw-fd-hard-v1": ["openclaw", "test_unit_fast"],
 	"openclaw-original-diagnostic-v1": ["openclaw", "lint_oxlint"],
