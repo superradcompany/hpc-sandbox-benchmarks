@@ -540,7 +540,7 @@ it("gated creation tags the workflow and suite for live allocation lookup", asyn
 					},
 				},
 			}),
-			createCtx(freshDir()),
+			ctx(suite({}), freshDir()),
 		);
 		expect(options).toMatchObject({
 			metadata: {
