@@ -155,21 +155,31 @@ fi
 # non-zero return in statement position aborts the runner via set -e exactly as a bare eval does
 # today, so PTS records a missing sample for this Task option and the batch continues.
 run_bounded() {
+	oom_kill_before=""
+	if [ -n "${BENCH_CG:-}" ] && [ -f "$BENCH_CG/memory.events" ]; then
+		oom_kill_before=$(awk '$1 == "oom_kill" { print $2 }' "$BENCH_CG/memory.events")
+	fi
 	status=0
 	timeout --kill-after=30 "$TASK_TIMEOUT_SECONDS" "$@" || status=$?
+	if [ "$status" -ne 0 ]; then
+		# A child OOM can be wrapped as exit 1 by pnpm/node. Capture the cgroup verdict on every
+		# failure, not only an outer SIGKILL, without changing the command or its exit status.
+		echo "task '${TASK}' failed (exit ${status}); nofile soft=$(ulimit -Sn) hard=$(ulimit -Hn)" >&2
+		for metric in memory.events memory.current memory.peak; do
+			if [ -n "${BENCH_CG:-}" ] && [ -f "$BENCH_CG/$metric" ]; then
+				sed "s/^/bench-cgroup: $metric /" "$BENCH_CG/$metric" >&2 2>/dev/null || true
+			fi
+		done
+		if [ -n "$oom_kill_before" ] && [ -f "$BENCH_CG/memory.events" ]; then
+			awk -v before="$oom_kill_before" '$1 == "oom_kill" { print "bench-cgroup: command oom_kill_delta " $2 - before }' "$BENCH_CG/memory.events" >&2
+		fi
+	fi
 	if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
 		echo "task '${TASK}' command timed out or was killed after ${TASK_TIMEOUT_SECONDS}s (exit ${status})" >&2
 		# Terminal-state snapshot into the (already-redirected) task log so the forensics tarball
 		# can settle thrash-vs-deadlock for a hung provider.
 		head -3 /proc/meminfo >&2 2>/dev/null || true
 		ps -eo pid,ppid,pgid,rss,etime,comm --sort=-rss 2>/dev/null | head -15 >&2 || true
-		# The cap's own verdict, for the same tarball: a real cgroup OOM increments oom_kill in
-		# memory.events, which exit 137 alone cannot distinguish from timeout's kill-after
-		# escalation. The selftest asserts on the oom_kill line to prove the cap KILLED, not
-		# merely engaged.
-		if [ -n "${BENCH_CG:-}" ] && [ -f "$BENCH_CG/memory.events" ]; then
-			sed 's/^/bench-cgroup: memory.events /' "$BENCH_CG/memory.events" >&2 2>/dev/null || true
-		fi
 		# timeout signals its own process group, but children that made a NEW group (openclaw's
 		# run-oxlint-shards spawns shards detached) survive — and an escapee need not carry the
 		# workspace path in its argv at all, so a leaked memory hog is swept three ways before it
