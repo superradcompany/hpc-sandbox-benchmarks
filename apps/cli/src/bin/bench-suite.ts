@@ -52,6 +52,7 @@ import {
 	runnerLifetimeError,
 	runPooled,
 } from "../lib/replicates.ts";
+import { missingSuiteMetrics } from "../lib/required-suite-metrics.ts";
 import { suiteMetricSummaryRows, suiteTaskSummaryRows } from "../lib/suite-summary.ts";
 import type { SuiteTaskPlan } from "../lib/suite-tasks.ts";
 import { describeSuiteTasks } from "../lib/suite-tasks.ts";
@@ -533,7 +534,7 @@ export async function runReplicate(ctx: ReplicateContext): Promise<ReplicateOutc
 	// Missing credentials (and an unusable sandbox) are recorded as a skip, not a throw — the lenient
 	// local-dev default. That would make a smoke run whose secret is missing/misnamed exit 0 having
 	// benchmarked nothing, so CI passes `--require <provider>` (or REQUIRE_PROVIDERS) to assert the
-	// provider actually reached `validated` — i.e. produced at least one catalogued metric.
+	// provider produced measurements. The per-suite coverage gate below also requires every declared metric.
 	if (ctx.required.length > 0) {
 		const reports = normalized.providers.map((p) => ({
 			provider: p.providerId,
@@ -552,6 +553,18 @@ export async function runReplicate(ctx: ReplicateContext): Promise<ReplicateOutc
 				details.push(line);
 			}
 			return { ...base, run: normalized, failed: true, detail: details.join("\n") };
+		}
+	}
+
+	if (ctx.required.includes(provider)) {
+		const missing = missingSuiteMetrics(normalized, provider, suite);
+		if (missing.length > 0) {
+			return {
+				...base,
+				run: normalized,
+				failed: true,
+				detail: `Required provider "${provider}" is missing ${missing.length} declared metrics for ${suite}: ${missing.join(", ")} — partial results retained in ${outFile}`,
+			};
 		}
 	}
 
