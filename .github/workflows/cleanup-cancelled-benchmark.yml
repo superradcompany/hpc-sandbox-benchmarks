@@ -1,0 +1,32 @@
+name: Controlled idle worker comparison
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  statuses: write
+concurrency:
+  group: controlled-idle-worker-comparison
+  cancel-in-progress: false
+jobs:
+  diagnostic:
+    if: github.repository == 'superradcompany/hpc-sandbox-benchmarks' && github.ref == 'refs/heads/superrad-benchmarks-parallel'
+    environment: privileged
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-workspace
+      - name: Run unchanged workloads after worker isolation
+        env:
+          MSB_API_KEY: ${{ secrets.MSB_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BENCH_PTS_PASSES: '2'
+        run: bun scripts/idle-worker-diagnostic.mts
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: idle-worker-diagnostic
+          path: diagnostic-results/
+          if-no-files-found: warn
