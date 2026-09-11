@@ -88,6 +88,7 @@ describe("realworld profiles: Task Option <-> target.env consistency", () => {
 			// as a slow build or a lost replicate months later rather than as a red test.
 			it.each([
 				"TASK_PREP_",
+				"TASK_SETUP_",
 				"TASK_REQUIRES_MEM_CAP_",
 			])("anchors every %s<value> to a declared Task Value", (prefix) => {
 				for (const key of Object.keys(env).filter((k) => k.startsWith(prefix))) {

@@ -403,6 +403,9 @@ cold_install)
 		echo "no ${cmd_var} in target.env for task '${TASK}'" >&2
 		exit 1
 	fi
+	# Apply profile fixes before warm-up and timing.
+	eval "setup=\"\${TASK_SETUP_${TASK}:-}\""
+	if [ -n "$setup" ]; then eval "$setup"; fi
 	if [ -z "$prep" ]; then
 		# Steady-state warm-up (fio's ramp_time, adapted): one unmeasured execution, then the same
 		# cold-artifact reset again so every sample is warm-toolchain + cold-artifact. Artifact
