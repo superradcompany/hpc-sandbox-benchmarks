@@ -1,6 +1,11 @@
 name: Controlled idle worker comparison
 on:
   workflow_dispatch:
+    inputs:
+      cleanup_ref:
+        description: Diagnostic sandbox to remove instead of running benchmarks
+        type: string
+        required: false
 permissions:
   contents: read
   statuses: write
@@ -23,6 +28,7 @@ jobs:
           MSB_API_KEY: ${{ secrets.MSB_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
           BENCH_PTS_PASSES: '2'
+          DIAGNOSTIC_CLEANUP_REF: ${{ inputs.cleanup_ref }}
         run: bun scripts/idle-worker-diagnostic.mts
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
