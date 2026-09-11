@@ -593,7 +593,11 @@ export function checkToolchainPrScope(
 	const jobs = asRecord(root.jobs, `${actionSmokeFile}: no jobs mapping`);
 	const smoke = asRecord(jobs.smoke, `${actionSmokeFile}: missing or malformed "smoke" job`);
 	const jobLabel = `${actionSmokeFile}::smoke`;
-	if (smoke["runs-on"] !== "starsling-ubuntu-24.04-2") {
+	if (
+		smoke["runs-on"] !== "starsling-ubuntu-24.04-2" &&
+		smoke["runs-on"] !==
+			"${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}"
+	) {
 		errors.push(`${jobLabel}: must use the standard 2-vCPU runner \`starsling-ubuntu-24.04-2\``);
 	}
 	if (smoke["timeout-minutes"] !== 5) {
