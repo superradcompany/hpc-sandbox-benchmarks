@@ -28,14 +28,21 @@ async function github(path: string, body?: unknown) {
 const cleanupOnly = process.env.DIAGNOSTIC_CLEANUP_REF;
 if (cleanupOnly) {
 	const opened = await openDriver("microsandbox-cloud");
-	await confirmRemoval(
-		opened.driver,
-		{ provider: "microsandbox-cloud", id: cleanupOnly },
-		AbortSignal.timeout(120_000),
-	);
-	console.log("Verified diagnostic sandbox removal:", cleanupOnly);
+	for (const id of cleanupOnly
+		.split(",")
+		.map((value) => value.trim())
+		.filter(Boolean)) {
+		if (!/^bench-cloud-[a-f0-9-]+$/.test(id)) throw new Error("Invalid benchmark sandbox name");
+		await confirmRemoval(
+			opened.driver,
+			{ provider: "microsandbox-cloud", id },
+			AbortSignal.timeout(120_000),
+		);
+		console.log("Verified diagnostic sandbox removal:", id);
+	}
 	process.exit(0);
 }
+
 for (const [index, suiteName] of (["realworld-better-auth", "cpu-node"] as const).entries()) {
 	const opened = await openDriver("microsandbox-cloud");
 	let ref: { provider: "microsandbox-cloud"; id: string } | undefined;
