@@ -49,14 +49,18 @@ fi
 echo
 echo "Still required in the GitHub UI (Settings → Environments → ${ENV_NAME}):"
 echo "  1. Required reviewers (at least one maintainer)"
-echo "  2. Deployment branches: main only"
+echo "  2. Deployment branches: main (add a narrow pattern such as 'bench/*' only if you want the"
+echo "     allow_branch dispatch on bench-matrix/bench-smoke to reach a pre-merge branch — without"
+echo "     it, a branch dispatch is refused here regardless of the workflow's own gate)"
 echo "  3. Move provider secrets onto this environment; delete repository-level copies"
 echo
 echo "Secret checklist:"
-echo "  E2B_API_KEY, DAYTONA_API_KEY, DAYTONA_TARGET,"
-echo "  MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, NOVITA_API_KEY,"
-echo "  MSB_API_KEY (and optional MSB_API_URL),"
-echo "  BL_API_KEY, BL_WORKSPACE"
+# >>> generated: provider-secret-checklist — bun run generate-provider-wiring
+echo "  E2B_API_KEY, DAYTONA_API_KEY, BL_API_KEY, BL_WORKSPACE"
+echo "  MSB_API_KEY, MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, NOVITA_API_KEY"
+echo "  RUNLOOP_API_KEY, RUN_CLOUD_API_KEY, TAMA_TOKEN"
+# <<< end generated: provider-secret-checklist
+echo "  VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID (Vercel bootstrap)"
 echo
 echo "Also required outside this Environment (see docs/ci-secrets.md):"
 echo "  - 'Allow GitHub Actions to create and approve pull requests' on"

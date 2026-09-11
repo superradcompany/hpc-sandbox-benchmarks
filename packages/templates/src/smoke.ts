@@ -5,7 +5,11 @@
 // The probes mirror what 99-manifest.sh bakes into the image; expects are pinned to pins.ts versions,
 // so a check fails loudly if the exact toolchain didn't make it through e2b's envd injection,
 // daytona's snapshot, or modal's fromRegistry.
-import { TOOLCHAIN_IMAGE_NAME, TOOLCHAIN_VERSION } from "@sandbox-benchmarks/schema";
+import {
+	PTS_STATE_SELECT_SH,
+	TOOLCHAIN_IMAGE_NAME,
+	TOOLCHAIN_VERSION,
+} from "@sandbox-benchmarks/schema";
 import { pins } from "./pins.ts";
 
 /** A single smoke probe: run `cmd`, pass iff it exits 0 and its output contains `expect`. */
@@ -56,7 +60,12 @@ export function ptsInstalledTestsSmokeCheck(installTests: string): SmokeCheck {
 	return {
 		name: "pts-installed-tests",
 		cmd:
-			'installed="$(PTS_USER_PATH_OVERRIDE=/var/lib/phoronix-test-suite/ phoronix-test-suite list-installed-tests 2>/dev/null)"; ' +
+			// Probe the SAME state the benchmark lane will use, root or injected unprivileged user, so a
+			// green smoke check cannot mean "root can see the profiles" while the run user cannot.
+			// `; ` because the snippet ends in `fi` — a bare space would splice the next assignment into
+			// the `if` and bash would reject the whole probe with a syntax error.
+			`${PTS_STATE_SELECT_SH}; ` +
+			'installed="$(phoronix-test-suite list-installed-tests 2>/dev/null)"; ' +
 			`profiles="$(printf '%s\\n' "$installed" | awk '$1 ~ /^pts\\// { print $1 }')"; ` +
 			verifyExpected +
 			`actual="$(printf '%s\\n' "$profiles" | awk 'NF { count++ } END { print count + 0 }')"; ` +
@@ -116,7 +125,7 @@ export const smokeChecks: readonly SmokeCheck[] = [
 	// The installed-count probe above trusts PTS's own install bookkeeping, which a launcher-only
 	// pgbench half-install satisfies. This one asserts the built postgres payload itself — in BOTH
 	// consumers, so the docker-level smoke proves the bake built it and the in-sandbox smoke proves
-	// it survived provider packaging (e2b envd injection / daytona snapshot / modal fromRegistry —
+	// it survived provider packaging (e2b envd injection / daytona snapshot / modal import / VCR —
 	// the same drift class that dropped fast-cli's Chrome libs).
 	...(pgbenchPayloadCheck ? [pgbenchPayloadCheck] : []),
 	// The enforced verification manifest is present (proves the base build's 99-manifest step ran)…

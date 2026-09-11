@@ -5,16 +5,27 @@ import { rawRunSchema } from "./lib/internal.ts";
 
 // Pure analysis over retained Samples: the Aggregates distribution and how it's computed.
 export * from "./analysis.ts";
+// Sandbox-attributed artifact provenance: which toolchain booted, and what established that.
+export * from "./artifact-evidence.ts";
+// Bounded canonical JSON shared by evidence producers and deterministic consumers.
+export * from "./canonical-json.ts";
 // The Metric Catalog — the registry of rankable Metrics, plus lookup helpers.
 export * from "./catalog.ts";
+// Sandbox-attributed provider cost evidence and complete-total semantics.
+export * from "./cost-evidence.ts";
 // The derived economics Dimension ($/run): its MetricDefs, the pricing-driven derivation, and the
 // pure cost models (burst vs fixed-infra amortization) they build on.
 export * from "./economics.ts";
+export * from "./experiment.ts";
 // The non-PTS, harness-measured Metric slice (lifecycle + control-plane) and its operation→id contract.
 export * from "./harness-metrics.ts";
+// Canonical persisted identifiers shared by Run and evidence schemas.
+export * from "./identifiers.ts";
 // Metric vocabulary: Dimension, Direction and the MetricDef shape every Metric declares.
 export * from "./metrics.ts";
-// Provider identity & economics registry (id, requiredEnvVars, pricing, isolation, spec-pinning).
+// Pure artifact lifecycle projections used by release composition roots.
+export * from "./provider-artifacts.ts";
+// Provider identity, declarative inputs/artifacts, and economics registry.
 export * from "./providers.ts";
 // The hand-authored curation layer over the generated PTS catalog (label/headline/dimension).
 export * from "./pts-overrides.ts";
@@ -28,27 +39,6 @@ export * from "./suite-contract.ts";
 export * from "./suites.ts";
 // Canonical toolchain image identity (name + version), shared by the build pins and runtime config.
 export * from "./toolchain.ts";
-
-/** The capabilities a sandbox provider may support. Stub set — expanded as providers land. */
-export const capabilities = ["spawn", "exec", "filesystem", "snapshot"] as const;
-export type Capability = (typeof capabilities)[number];
-
-/** Which capabilities a given provider supports. */
-export type CapabilityFlags = Record<Capability, boolean>;
-
-/**
- * The capability view of a provider, keyed by the same `id` as the {@link ProviderMeta} registry in
- * `./providers.ts`. Identity and economics live in `ProviderMeta` (its single owner); this type adds
- * the orthogonal "what can it do" axis. The two are joined by `id`, never merged.
- */
-export interface ProviderDescriptor {
-	/** Stable identifier, joined against {@link ProviderMeta.id}, e.g. "e2b", "daytona", "modal". */
-	id: string;
-	/** Human-readable name. */
-	displayName: string;
-	/** Capabilities the provider supports. */
-	capabilities: CapabilityFlags;
-}
 
 /**
  * A single raw, un-normalized benchmark run as emitted by the harness.

@@ -1,11 +1,13 @@
-// Invariant: the GitHub workflows that dispatch live benchmarks stay in lockstep with the schema
-// registries (PROVIDERS + SUITE_NAMES). GHA can't import TypeScript, so the provider/suite choices and
-// the per-provider credential env block are hand-mirrored across .github/workflows/bench-*.yml; this
-// gate re-derives the truth from the registries and fails if someone adds a provider/suite (or its
-// required secret) without updating the workflows. bench-matrix.yml has one suite-matrix job that calls
-// the reusable bench-suite.yml (native nesting: suite / provider) — so the credential block + run-job
-// timeout live in the reusable (the "matrix side" of the credential/timeout checks reads it), and a
-// separate invariant asserts the suite-matrix caller stays wired to plan.outputs.suites. Mirrors
+// Invariant: the GitHub workflows that dispatch live benchmarks stay in lockstep with the suite
+// registry and retain their safe delegation/timeout shape. Provider choices and provider input env are
+// generated from metadata and owned by check:provider-wiring, so this gate deliberately does not
+// compare those managed regions a second time. Both dispatch lanes — bench-matrix.yml (the full
+// matrix, ending in a dataset commit) and
+// bench-smoke.yml (the same pipeline narrowed to one provider × suite and stopped before that commit) —
+// are one `plan` job plus one suite-matrix job calling the reusable bench-suite.yml (native nesting:
+// suite / provider). The credential block + run-job timeout live in that single reusable, so the
+// credential/timeout checks read it; separate invariants assert both callers stay wired to
+// plan.outputs.suites and that neither lane grows a benchmark cell of its own again. Mirrors
 // runner-benchmarking's test/workflow-{env,suite}-sync.test.ts. See ./lib/workflow-sync.ts for the
 // parsers + pure checks. Nesting (invariant 6) lives in ./lib/workflow-nesting.ts; YAML helpers in
 // ./lib/workflow-yaml.ts — workflow-sync.ts re-exports the public surface.
@@ -14,37 +16,20 @@
 // `bun test`, same precedent as boundary.test.ts); the rest is unit coverage of the parsers and the
 // failure messages on synthetic drift, so a future regression names the offending file + key.
 import { describe, expect, test } from "bun:test";
-import {
-	PLACEMENT_GATE_TIMEOUT_MINUTES,
-	PROVIDERS,
-	SUITE_NAMES,
-	SUITES,
-} from "@sandbox-benchmarks/schema";
+import { PLACEMENT_GATE_TIMEOUT_MINUTES, SUITE_NAMES, SUITES } from "@sandbox-benchmarks/schema";
 import {
 	CELL_BUDGET_ENV_KEY,
 	checkCellBudgetEnv,
-	checkCredentialEnv,
-	checkProviderInput,
+	checkLaneDelegates,
 	checkSuiteInput,
-	checkSuiteMatrixCaller,
-	checkSuiteWorkflowNesting,
 	checkWorkflowTimeouts,
 	dispatchInput,
-	EXPECTED_PROVIDER_NAME_EXPR,
-	EXPECTED_REPLICATES_ARG,
-	EXPECTED_REPLICATES_ENV_EXPR,
-	EXPECTED_REPLICATES_INPUT_EXPR,
-	EXPECTED_SUITE_MATRIX_EXPR,
-	EXPECTED_SUITE_NAME_EXPR,
 	jobTimeoutMinutes,
 	MATRIX_WORKFLOW,
-	matrixSuiteCaller,
-	REPLICATES_ENV_KEY,
 	RUN_STEP,
 	readWorkflow,
 	requiredCredentialKeys,
 	runCheck,
-	SMOKE_JOB,
 	SMOKE_WORKFLOW,
 	SUITE_JOB,
 	SUITE_WORKFLOW,
@@ -52,37 +37,26 @@ import {
 	WORKFLOW_TIMEOUT_MARGIN_MINUTES,
 } from "./lib/workflow-sync.ts";
 
-const smoke = readWorkflow(SMOKE_WORKFLOW);
 const matrix = readWorkflow(MATRIX_WORKFLOW);
+const smoke = readWorkflow(SMOKE_WORKFLOW);
 const suiteWf = readWorkflow(SUITE_WORKFLOW);
-const providerInput = dispatchInput(smoke, "provider", SMOKE_WORKFLOW);
 const suiteInput = dispatchInput(smoke, "suite", SMOKE_WORKFLOW);
-const smokeEnv = stepEnv(smoke, SMOKE_JOB, RUN_STEP, SMOKE_WORKFLOW);
 const suiteEnv = stepEnv(suiteWf, SUITE_JOB, RUN_STEP, SUITE_WORKFLOW);
 
 describe("parsers against the real workflow files", () => {
-	test("dispatchInput extracts the smoke provider choice (type + options + default)", () => {
-		expect(new Set(providerInput.options)).toEqual(new Set(PROVIDERS.map((p) => p.id)));
-		expect(providerInput.default).toBeDefined();
-		// `type: choice` is what makes GitHub enforce the options — assert it's captured.
-		expect(providerInput.type).toBe("choice");
-	});
-
 	test("dispatchInput extracts the smoke suite choice", () => {
 		expect(new Set(suiteInput.options)).toEqual(new Set(SUITE_NAMES));
 		expect(suiteInput.type).toBe("choice");
 	});
 
-	test("stepEnv extracts a realistic credential block from both lanes", () => {
-		expect(smokeEnv).toContainKey("DAYTONA_API_KEY");
-		// The matrix lane's credential block lives in the reusable bench-suite.yml.
+	test("stepEnv extracts the one real credential block, in the reusable cell", () => {
 		expect(suiteEnv).toContainKey("E2B_API_KEY");
+		expect(suiteEnv).toContainKey("DAYTONA_API_KEY");
 		// A real block (credentials + runtime context), not a parse fragment.
-		expect(Object.keys(smokeEnv).length).toBeGreaterThanOrEqual(8);
+		expect(Object.keys(suiteEnv).length).toBeGreaterThanOrEqual(8);
 	});
 
-	test("both live-run jobs reserve host margin beyond the longest suite", () => {
-		expect(jobTimeoutMinutes(smoke, SMOKE_JOB, SMOKE_WORKFLOW)).toBe(180);
+	test("the live-run job reserves host margin beyond the longest suite", () => {
 		expect(jobTimeoutMinutes(suiteWf, SUITE_JOB, SUITE_WORKFLOW)).toBe(180);
 	});
 
@@ -100,10 +74,10 @@ describe("parsers against the real workflow files", () => {
 	});
 
 	test("stepEnv throws on a missing job, step, or env mapping", () => {
-		expect(() => stepEnv(smoke, "no-such-job", RUN_STEP, SMOKE_WORKFLOW)).toThrow(
+		expect(() => stepEnv(suiteWf, "no-such-job", RUN_STEP, SUITE_WORKFLOW)).toThrow(
 			'job "no-such-job" not found',
 		);
-		expect(() => stepEnv(smoke, SMOKE_JOB, "No Such Step", SMOKE_WORKFLOW)).toThrow(
+		expect(() => stepEnv(suiteWf, SUITE_JOB, "No Such Step", SUITE_WORKFLOW)).toThrow(
 			'has no step named "No Such Step"',
 		);
 		const yaml = Bun.YAML.stringify({ jobs: { j: { steps: [{ name: "bare" }] } } });
@@ -115,7 +89,7 @@ describe("parsers against the real workflow files", () => {
 
 describe("checkWorkflowTimeouts", () => {
 	test("passes timeouts with the required host margin", () => {
-		expect(checkWorkflowTimeouts({ smoke: 180, matrix: 180 })).toEqual([]);
+		expect(checkWorkflowTimeouts({ bench: 180 })).toEqual([]);
 	});
 
 	test("flags a job cap that cannot outlast the longest suite", () => {
@@ -159,62 +133,6 @@ describe("checkCellBudgetEnv", () => {
 	});
 });
 
-describe("checkProviderInput", () => {
-	test("the real provider choice is in sync", () => {
-		expect(checkProviderInput(providerInput)).toEqual([]);
-	});
-
-	test("flags a registry provider dropped from the options", () => {
-		const drifted = {
-			...providerInput,
-			options: providerInput.options?.filter((o) => o !== "modal-gvisor"),
-		};
-		const errors = checkProviderInput(drifted);
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('missing "modal-gvisor"');
-		expect(errors[0]).toContain("PROVIDERS");
-	});
-
-	test("flags a stray option that no provider owns", () => {
-		const drifted = { ...providerInput, options: [...(providerInput.options ?? []), "fly"] };
-		const errors = checkProviderInput(drifted);
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('option "fly" is not in PROVIDERS');
-	});
-
-	test("flags a default that is not a known provider", () => {
-		const errors = checkProviderInput({ ...providerInput, default: "ghost" });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('default "ghost"');
-	});
-
-	test("flags a missing options list entirely", () => {
-		const errors = checkProviderInput({ type: "choice", default: "e2b" });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("no options list");
-	});
-
-	test("flags a missing default (the invariant requires one, not a vacuous pass)", () => {
-		const errors = checkProviderInput({ type: "choice", options: providerInput.options });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("no valid string default");
-	});
-
-	test('flags a non-choice type (options are unenforced free text unless "type: choice")', () => {
-		// Registry-matching options/default, but type: string → GitHub ignores the options list.
-		const errors = checkProviderInput({ ...providerInput, type: "string" });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('not "type: choice"');
-		expect(errors[0]).toContain('"string"');
-	});
-
-	test("flags a missing type (defaults to free-text string in GHA)", () => {
-		const errors = checkProviderInput({ ...providerInput, type: undefined });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("no type");
-	});
-});
-
 describe("checkSuiteInput", () => {
 	test("the real suite choice is in sync", () => {
 		expect(checkSuiteInput(suiteInput)).toEqual([]);
@@ -243,7 +161,7 @@ describe("checkSuiteInput", () => {
 	});
 });
 
-describe("checkCredentialEnv", () => {
+describe("requiredCredentialKeys", () => {
 	test("requiredCredentialKeys records provenance per provider", () => {
 		const required = requiredCredentialKeys();
 		expect(required.get("E2B_API_KEY")).toEqual(["e2b"]);
@@ -251,255 +169,130 @@ describe("checkCredentialEnv", () => {
 		expect(required.get("MODAL_TOKEN_ID")).toEqual(["modal-gvisor", "modal-vm"]);
 		expect(required.get("DAYTONA_API_KEY")).toEqual(["daytona-vm", "daytona-container"]);
 	});
-
-	test("flags a required key dropped from the matrix (reusable) block, naming key and file", () => {
-		const { E2B_API_KEY: _, ...drifted } = suiteEnv;
-		const errors = checkCredentialEnv({
-			[SMOKE_WORKFLOW]: smokeEnv,
-			[SUITE_WORKFLOW]: drifted,
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("E2B_API_KEY");
-		expect(errors[0]).toContain("required by provider e2b");
-		expect(errors[0]).toContain(SUITE_WORKFLOW);
-		expect(errors[0]).not.toContain(SMOKE_WORKFLOW);
-	});
-
-	test("flags a shared key whose value expression differs across the two lanes", () => {
-		const drifted = { ...suiteEnv, DAYTONA_API_KEY: `\${{ secrets.DAYTONA_API_KEY_OTHER }}` };
-		const errors = checkCredentialEnv({
-			[SMOKE_WORKFLOW]: smokeEnv,
-			[SUITE_WORKFLOW]: drifted,
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("DAYTONA_API_KEY:");
-		expect(errors[0]).toContain(smokeEnv.DAYTONA_API_KEY);
-		expect(errors[0]).toContain("DAYTONA_API_KEY_OTHER");
-	});
-
-	test("tolerates extra runtime-context vars beyond the required credentials", () => {
-		const errors = checkCredentialEnv({
-			[SMOKE_WORKFLOW]: { ...smokeEnv, SOME_RUNTIME_CONTEXT: "x" },
-			[SUITE_WORKFLOW]: suiteEnv,
-		});
-		expect(errors).toEqual([]);
-	});
 });
 
-describe("checkSuiteMatrixCaller", () => {
-	const realCaller = matrixSuiteCaller(matrix);
+describe("checkLaneDelegates", () => {
+	const CREDENTIALS = [...requiredCredentialKeys().keys()];
+	const lane = (doc: unknown, label = "synthetic.yml"): string[] =>
+		checkLaneDelegates(doc, label, CREDENTIALS);
+	const laneYaml = (jobs: object): string[] => lane(Bun.YAML.parse(Bun.YAML.stringify({ jobs })));
 
-	test("matrixSuiteCaller extracts the real suite-matrix nesting wiring", () => {
-		expect(realCaller.jobId).toBe("suite");
-		expect(realCaller.name).toBe(EXPECTED_SUITE_NAME_EXPR);
-		expect(realCaller.suiteInput).toBe(EXPECTED_SUITE_NAME_EXPR);
-		expect(realCaller.matrixSuiteExpr).toBe(EXPECTED_SUITE_MATRIX_EXPR);
-		expect(realCaller.publishNeeds).toContain("suite");
+	// Invariant 3b: the consolidation itself. Both dispatch lanes must reach sandboxes only through the
+	// reusable — a re-introduced cell in either is the copy-paste this change removed.
+	test("the real dispatch lanes own no benchmark cell", () => {
+		expect(lane(smoke, SMOKE_WORKFLOW)).toEqual([]);
+		expect(lane(matrix, MATRIX_WORKFLOW)).toEqual([]);
 	});
 
-	test("the real suite-matrix caller is wired for native nesting", () => {
-		expect(checkSuiteMatrixCaller(realCaller)).toEqual([]);
+	test("the reusable itself is where the cell lives (so it would NOT pass this lane check)", () => {
+		const errors = lane(suiteWf, SUITE_WORKFLOW);
+		// All three probes fire on the real cell: the step name, the run: that drives it, and its
+		// credential block. That is the shape the lanes must never have.
+		expect(errors.length).toBeGreaterThanOrEqual(3);
+		for (const error of errors) expect(error).toContain(SUITE_JOB);
 	});
 
-	test("flags a caller whose display name is not matrix.suite", () => {
-		const errors = checkSuiteMatrixCaller({ ...realCaller, name: "Bench suites" });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("name must be");
-		expect(errors[0]).toContain(EXPECTED_SUITE_NAME_EXPR);
-	});
-
-	test("flags a caller whose with.suite is not matrix.suite", () => {
-		const errors = checkSuiteMatrixCaller({ ...realCaller, suiteInput: "cpu-node" });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("with.suite must be");
-	});
-
-	test("flags a caller whose suite axis is not plan.outputs.suites", () => {
-		const errors = checkSuiteMatrixCaller({
-			...realCaller,
-			// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal (wrong axis), not a JS template.
-			matrixSuiteExpr: "${{ fromJSON(needs.plan.outputs.providers) }}",
+	test("flags a lane that re-grows its own run step, naming the job", () => {
+		const errors = laneYaml({
+			plan: { "runs-on": "ubuntu-24.04", steps: [{ name: "Plan" }] },
+			smoke: { "runs-on": "ubuntu-24.04", steps: [{ name: RUN_STEP }] },
 		});
 		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("strategy.matrix.suite must be");
-		expect(errors[0]).toContain(EXPECTED_SUITE_MATRIX_EXPR);
+		expect(errors[0]).toContain('job "smoke"');
+		expect(errors[0]).toContain(RUN_STEP);
 	});
 
-	test("flags publish that does not need the suite-matrix caller", () => {
-		const errors = checkSuiteMatrixCaller({ ...realCaller, publishNeeds: ["plan"] });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('publish" must need "suite"');
-	});
-
-	test("matrixSuiteCaller throws when no job calls the reusable", () => {
-		const yaml = Bun.YAML.stringify({ jobs: { plan: { "runs-on": "ubuntu-24.04" } } });
-		expect(() => matrixSuiteCaller(Bun.YAML.parse(yaml), "synthetic.yml")).toThrow(
-			"no job calls the reusable bench-suite.yml",
-		);
-	});
-
-	test("matrixSuiteCaller throws on multiple suite-matrix callers", () => {
-		const yaml = Bun.YAML.stringify({
-			jobs: {
-				a: {
-					name: EXPECTED_SUITE_NAME_EXPR,
-					uses: "./.github/workflows/bench-suite.yml",
-					with: { suite: EXPECTED_SUITE_NAME_EXPR, replicates: EXPECTED_REPLICATES_INPUT_EXPR },
-					strategy: { matrix: { suite: EXPECTED_SUITE_MATRIX_EXPR } },
-				},
-				b: {
-					name: EXPECTED_SUITE_NAME_EXPR,
-					uses: "./.github/workflows/bench-suite.yml",
-					with: { suite: EXPECTED_SUITE_NAME_EXPR, replicates: EXPECTED_REPLICATES_INPUT_EXPR },
-					strategy: { matrix: { suite: EXPECTED_SUITE_MATRIX_EXPR } },
-				},
+	// The bypass a name-only check misses: same cell, fresh step name. This is the shape someone
+	// re-adding a cell by hand writes — they do not copy the reusable's step name along with it.
+	test("flags a re-grown cell hiding under a different step name", () => {
+		const errors = laneYaml({
+			smoke: {
+				"runs-on": "ubuntu-24.04",
+				steps: [
+					{ name: "Benchmark the cell", run: "bun apps/cli/src/bin/bench-suite.ts e2b system" },
+				],
 			},
 		});
-		expect(() => matrixSuiteCaller(Bun.YAML.parse(yaml), "synthetic.yml")).toThrow(
-			"expected exactly one suite-matrix caller",
-		);
-	});
-
-	// The caller-side twin of the run-step bypass: hardcoding the array here passes every other nesting
-	// check while quietly measuring one sandbox per cell.
-	test("flags a caller that hardcodes with.replicates instead of taking the plan's slice", () => {
-		const caller = {
-			...matrixSuiteCaller(matrix),
-			replicatesInput: "[0]",
-		};
-		const errors = checkSuiteMatrixCaller(caller, "synthetic.yml");
 		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("with.replicates must be");
-		expect(errors[0]).toContain(EXPECTED_REPLICATES_INPUT_EXPR);
+		expect(errors[0]).toContain("bench-suite.ts");
 	});
 
-	test("matrixSuiteCaller throws on a reusable-caller job with no string replicates", () => {
-		const yaml = Bun.YAML.stringify({
-			jobs: {
-				bad: {
-					uses: "./.github/workflows/bench-suite.yml",
-					with: { suite: EXPECTED_SUITE_NAME_EXPR },
-					strategy: { matrix: { suite: EXPECTED_SUITE_MATRIX_EXPR } },
-				},
+	// The other bypass: credentials on a JOB-level env, which every step inherits, so no per-step scan
+	// would ever see them.
+	test("flags provider credentials hung off a job-level env", () => {
+		const errors = laneYaml({
+			smoke: {
+				"runs-on": "ubuntu-24.04",
+				env: { E2B_API_KEY: "x", DAYTONA_API_KEY: "y", SOME_RUNTIME_CONTEXT: "z" },
+				steps: [{ name: "Something else" }],
 			},
 		});
-		expect(() => matrixSuiteCaller(Bun.YAML.parse(yaml), "synthetic.yml")).toThrow(
-			'without a string "replicates" input',
-		);
-	});
-
-	test("matrixSuiteCaller throws on a reusable-caller job with no string suite", () => {
-		const yaml = Bun.YAML.stringify({
-			jobs: { bad: { uses: "./.github/workflows/bench-suite.yml", with: { providers: "[]" } } },
-		});
-		expect(() => matrixSuiteCaller(Bun.YAML.parse(yaml), "synthetic.yml")).toThrow(
-			'without a string "suite" input',
-		);
-	});
-});
-
-describe("checkSuiteWorkflowNesting", () => {
-	const suiteWf = readWorkflow(SUITE_WORKFLOW);
-
-	test("the real reusable fan-out job is named matrix.provider", () => {
-		expect(checkSuiteWorkflowNesting(suiteWf)).toEqual([]);
-	});
-
-	/** A fan-out job that satisfies every nesting invariant; each drift test bends exactly one field. */
-	const wiredRunStep = {
-		name: RUN_STEP,
-		env: { [REPLICATES_ENV_KEY]: EXPECTED_REPLICATES_ENV_EXPR },
-		run: `bun apps/cli/src/bin/bench-suite.ts "$BENCH_PROVIDER" "$BENCH_SUITE" "$GITHUB_RUN_ID" ${EXPECTED_REPLICATES_ARG}`,
-	};
-	const wiredFanOut = {
-		name: EXPECTED_PROVIDER_NAME_EXPR,
-		"runs-on": "ubuntu-24.04",
-		steps: [wiredRunStep],
-	};
-	const nestingErrors = (job: object): string[] =>
-		checkSuiteWorkflowNesting(
-			Bun.YAML.parse(Bun.YAML.stringify({ jobs: { [SUITE_JOB]: job } })),
-			"synthetic.yml",
-		);
-
-	test("passes a fan-out job named matrix.provider that receives the replicate array", () => {
-		expect(nestingErrors(wiredFanOut)).toEqual([]);
-	});
-
-	test("flags a fan-out job whose display name is not matrix.provider", () => {
-		const errors = nestingErrors({ ...wiredFanOut, name: "Run" });
 		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("name must be");
-		expect(errors[0]).toContain(EXPECTED_PROVIDER_NAME_EXPR);
+		expect(errors[0]).toContain("DAYTONA_API_KEY, E2B_API_KEY");
+		// Non-credential env is not the lane's business.
+		expect(errors[0]).not.toContain("SOME_RUNTIME_CONTEXT");
 	});
 
-	// Re-adding the axis is the exact regression the in-process fan-out exists to prevent: it would
-	// silently restore one idle runner per replicate.
-	test("flags a reinstated replicate matrix axis", () => {
-		const errors = nestingErrors({
-			...wiredFanOut,
-			strategy: { matrix: { provider: "[]", replicate: "[0,1]" } },
+	test("flags provider credentials on a step env too", () => {
+		const errors = laneYaml({
+			smoke: { "runs-on": "ubuntu-24.04", steps: [{ name: "x", env: { NOVITA_API_KEY: "k" } }] },
 		});
 		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain('must not have a "replicate" matrix axis');
+		expect(errors[0]).toContain("NOVITA_API_KEY");
 	});
 
-	test("accepts a provider-only matrix", () => {
-		expect(nestingErrors({ ...wiredFanOut, strategy: { matrix: { provider: "[]" } } })).toEqual([]);
-	});
-
-	// Without the env wiring the cell falls back to ONE sandbox — a green run that publishes R=1 while
-	// the plan asked for R=12, so the drift must fail the gate rather than the dataset.
-	test("flags a run step that never receives the replicate array", () => {
-		const errors = nestingErrors({
-			...wiredFanOut,
-			steps: [{ ...wiredRunStep, env: {} }],
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain(REPLICATES_ENV_KEY);
-		expect(errors[0]).toContain("no such env key");
-	});
-
-	// The bypass that made the env check alone insufficient: keep the env key, drop the flag. The cell
-	// then takes bench-suite's single-sandbox default and commit-dataset's legacy glob collects the one
-	// shard without complaint — a green matrix run publishing R=1.
-	test("flags a run step that sets the env but never passes --replicates", () => {
-		const errors = nestingErrors({
-			...wiredFanOut,
-			steps: [
-				{
-					...wiredRunStep,
-					run: 'bun apps/cli/src/bin/bench-suite.ts "$BENCH_PROVIDER" "$BENCH_SUITE" "$GITHUB_RUN_ID"',
+	// A lane legitimately runs bun bins (the planners) and carries non-credential env; neither is a cell.
+	test("passes a lane that plans and orchestrates without touching a credential", () => {
+		expect(
+			laneYaml({
+				plan: {
+					"runs-on": "ubuntu-24.04",
+					steps: [
+						{
+							name: "Plan",
+							run: "bun apps/cli/src/bin/plan-suites.ts",
+							env: { BENCH_SUITES: "s" },
+						},
+					],
 				},
-			],
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain(EXPECTED_REPLICATES_ARG);
-	});
-
-	test("flags a run step with no run: command at all", () => {
-		const { run: _dropped, ...noRun } = wiredRunStep;
-		const errors = nestingErrors({ ...wiredFanOut, steps: [noRun] });
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain("no run: command");
-	});
-
-	// `replicas` (the dispatch knob) vs `replicates` (the plan's index array) is the plausible typo:
-	// it's a live input name, so it resolves to a value rather than failing the workflow outright.
-	test("flags a replicate array wired to the wrong expression", () => {
-		// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal, not a JS template.
-		const wrongExpr = "${{ inputs.replicas }}";
-		const errors = nestingErrors({
-			...wiredFanOut,
-			steps: [{ ...wiredRunStep, env: { [REPLICATES_ENV_KEY]: wrongExpr } }],
-		});
-		expect(errors).toHaveLength(1);
-		expect(errors[0]).toContain(EXPECTED_REPLICATES_ENV_EXPR);
+				suite: { uses: "./.github/workflows/bench-suite.yml", with: { suite: "system" } },
+			}),
+		).toEqual([]);
 	});
 });
 
-describe("the gate itself", () => {
-	test("the real workflows are in lockstep with the registries", () => {
-		expect(runCheck()).toEqual([]);
-	});
+test("production workflows preserve planned account batching and strict promotion", () => {
+	expect(runCheck()).toEqual([]);
+});
+
+test("the integrated workflow gate rejects parallel rounds, serialised batches, detached plan axes and legacy promotion", async () => {
+	const { checkExperimentNesting } = await import("./lib/workflow-nesting.ts");
+	const docs = Object.fromEntries(
+		[
+			"bench-matrix.yml",
+			"bench-smoke.yml",
+			"bench-account.yml",
+			"bench-round.yml",
+			"bench-suite.yml",
+			"commit-dataset.yml",
+		].map((file) => [file, readWorkflow(`.github/workflows/${file}`)]),
+	);
+	const source = JSON.stringify(docs);
+	for (const [before, after] of [
+		// Rounds serialised (bench-account.yml is the only remaining max-parallel: 1).
+		['"max-parallel":1', '"max-parallel":2'],
+		// A round's batches created together: reintroducing max-parallel there is one approval per batch.
+		[
+			'"fail-fast":false,"matrix":{"include":',
+			'"fail-fast":false,"max-parallel":1,"matrix":{"include":',
+		],
+		["fromJSON(needs.plan.outputs.accounts)", "fromJSON(needs.plan.outputs.suites)"],
+		["data/dataset experiment/manifest/plan.json experiment/attempts", "data/dataset"],
+		["workflow-experiment.ts execute", "bench-suite.ts"],
+	] as const) {
+		expect(source).toContain(before);
+		expect(
+			checkExperimentNesting(JSON.parse(source.replace(before, after))).length,
+		).toBeGreaterThan(0);
+	}
 });

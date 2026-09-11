@@ -1,11 +1,14 @@
 // Invariant: the GitHub Actions layer stays hardened. (1) every actions/checkout opts out of
 // credential persistence unless it is an allowlisted pushing checkout, (2) ci-lint.yml runs
 // actionlint + zizmor at the agreed gate threshold, (3) custom-secret / write jobs declare
-// environment: privileged, and (4) toolchain publish is workflow_dispatch-only. The
-// runHardeningCheck() test against the real .github files IS the gate's CI enforcement point
-// (same precedent as workflow-registry-sync.test.ts); the rest is unit coverage of the pure checks
-// on synthetic drift so a regression names the offender. See ./lib/workflow-hardening.ts.
+// environment: privileged, (4) toolchain publish is workflow_dispatch-only, and (5) toolchain PR
+// smoke keeps expensive image inputs separate from lightweight setup-action coverage. The
+// runHardeningCheck() test against the real .github files IS the gate's CI enforcement point (same
+// precedent as workflow-registry-sync.test.ts); the rest is unit coverage of the pure checks on
+// synthetic drift so a regression names the offender. See ./lib/workflow-hardening.ts.
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { CheckoutStep } from "./lib/workflow-hardening.ts";
 import {
 	CI_LINT_WORKFLOW,
@@ -15,19 +18,51 @@ import {
 	checkPersistCredentials,
 	checkPrivilegedEnvironment,
 	checkToolchainDispatchOnly,
+	checkToolchainPrScope,
 	customSecretsIn,
 	listWorkflowFiles,
 	PRIVILEGED_ENVIRONMENT,
 	readWorkflow,
 	runHardeningCheck,
+	TOOLCHAIN_ACTION_SMOKE_PR_PATHS,
+	TOOLCHAIN_ACTION_SMOKE_WORKFLOW,
+	TOOLCHAIN_IMAGE_PR_PATHS,
 	TOOLCHAIN_WORKFLOW,
 	WORKFLOWS_DIR,
 } from "./lib/workflow-hardening.ts";
+import { asRecord, stepByName, stepEnv } from "./lib/workflow-yaml.ts";
+import { findRepoRoot } from "./lib/workspace.ts";
 
 /** A no-op step — the body for fixtures whose step content is irrelevant to what they assert. */
 const NOOP_STEP = { run: "true" };
 /** Build a single-job workflow doc: `{ ...root, jobs: { [id]: job } }`. */
 const oneJob = (id: string, job: object, root: object = {}) => ({ ...root, jobs: { [id]: job } });
+const SCOPED_RUNCLOUD_KEY =
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression under test
+	"${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'runcloud') && secrets.RUN_CLOUD_API_KEY || '' }}";
+const SCOPED_RUNLOOP_KEY =
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression under test
+	"${{ contains(fromJSON(needs.plan.outputs.matrix).include.*.provider, 'runloop') && secrets.RUNLOOP_API_KEY || '' }}";
+const SELECTED_BASE_IMAGE =
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression under test
+	"${{ needs.build.outputs.base-digest-ref || needs.plan.outputs.image-source }}";
+// biome-ignore lint/suspicious/noTemplateCurlyInString: literal shell parameter expansion under test
+const BASE_IMAGE_ARG = '--base-image "${BASE_IMAGE_REF}"';
+
+function workflowJob(doc: unknown, jobId: string, label: string): Record<string, unknown> {
+	const root = asRecord(doc, `${label}: not a YAML mapping`);
+	const jobs = asRecord(root.jobs, `${label}: no jobs mapping`);
+	return asRecord(jobs[jobId], `${label}: job "${jobId}" not found`);
+}
+
+/** Every value assigned to a named key below one parsed YAML node, including job- and step-level env. */
+function valuesForKey(value: unknown, key: string): unknown[] {
+	if (Array.isArray(value)) return value.flatMap((item) => valuesForKey(item, key));
+	if (value === null || typeof value !== "object") return [];
+	return Object.entries(value).flatMap(([name, child]) =>
+		name === key ? [child] : valuesForKey(child, key),
+	);
+}
 
 describe("checkoutSteps against the real workflows", () => {
 	test("every workflow's checkouts are extracted with a persist-credentials reading", () => {
@@ -146,6 +181,120 @@ describe("checkCiLintGate", () => {
 		const errors = checkCiLintGate(loosened);
 		expect(errors).toHaveLength(1);
 		expect(errors[0]).toContain("--min-confidence high");
+	});
+});
+
+describe("Vercel CLI authentication", () => {
+	test("all Vercel jobs use the shared action without raw token minting", () => {
+		const root = findRepoRoot();
+		const workflowText = ["bench-smoke.yml", "bench-suite.yml", "toolchain-image.yml"]
+			.map((file) => readFileSync(join(root, WORKFLOWS_DIR, file), "utf8"))
+			.join("\n");
+		// Three call sites: the reusable benchmark cell (bench-suite.yml) plus toolchain-image.yml's two.
+		// bench-smoke.yml is still read here — not because it authenticates (it reaches Vercel only
+		// through the reusable cell now) but so the "no hand-minted token" assertions below still cover
+		// it if a lane ever grows its own credential handling again.
+		expect(workflowText.match(/uses: \.\/\.github\/actions\/vercel-auth/g)).toHaveLength(3);
+		expect(workflowText).not.toContain("api.vercel.com/v1/projects");
+		expect(workflowText).not.toContain("VERCEL_OIDC_TOKEN_FILE");
+		expect(workflowText).not.toContain("docker login vcr.vercel.com");
+		// Two best-effort `always()` fallbacks remain; the immediate post-mirror logout is fail-closed.
+		expect(workflowText.match(/docker logout vcr\.vercel\.com \|\| true/g)).toHaveLength(2);
+		expect(workflowText).toContain('vercel vcr push docker "$target_name"');
+		const toolchain = readFileSync(join(root, WORKFLOWS_DIR, "toolchain-image.yml"), "utf8");
+		expect(toolchain.indexOf("- name: Log out of VCR after mirror")).toBeGreaterThan(
+			toolchain.indexOf("- name: Mirror candidate into VCR"),
+		);
+		expect(toolchain.indexOf("- name: Log out of VCR after mirror")).toBeLessThan(
+			toolchain.indexOf("- name: Bake + verify candidate"),
+		);
+		expect(toolchain).toContain(
+			"- name: Log out of VCR after mirror\n        if: matrix.provider == 'vercel' && steps.vercel-vcr.outcome == 'success'\n        run: docker logout vcr.vercel.com\n",
+		);
+		expect(toolchain).not.toContain(
+			"- name: Log out of VCR after mirror\n        if: matrix.provider == 'vercel' && steps.vercel-vcr.outcome == 'success'\n        run: docker logout vcr.vercel.com || true",
+		);
+		expect(toolchain).toContain("- name: Ensure VCR logout\n        if: always()");
+	});
+
+	test("the composite masks the OIDC token and deletes its temporary env file before export", () => {
+		const root = join(findRepoRoot(), ".github/actions/vercel-auth");
+		const action = readFileSync(join(root, "action.yml"), "utf8");
+		const script = readFileSync(join(root, "auth.sh"), "utf8");
+		expect(action).toContain(`run: "\${GITHUB_ACTION_PATH}/auth.sh"`);
+		expect(script).toContain("pull --yes --non-interactive");
+		expect(script).toContain('env pull "$env_file" --yes --non-interactive');
+		expect(script).toContain("vcr login docker");
+		expect(script.indexOf('rm -f "$env_file" "$pull_env_file"')).toBeLessThan(
+			script.indexOf("printf '::add-mask::%s\\n'"),
+		);
+		expect(script.indexOf("printf '::add-mask::%s\\n'")).toBeLessThan(script.indexOf("GITHUB_ENV"));
+	});
+});
+
+describe("Namespace token authentication", () => {
+	test("all managed lanes share one producer id and output contract", () => {
+		const root = findRepoRoot();
+		const workflowText = ["bench-suite.yml", "toolchain-image.yml"]
+			.map((file) => readFileSync(join(root, WORKFLOWS_DIR, file), "utf8"))
+			.join("\n");
+		expect(workflowText.match(/uses: \.\/\.github\/actions\/namespace-token/g)).toHaveLength(3);
+		expect(workflowText.match(/id: namespace/g)).toHaveLength(3);
+		expect(
+			workflowText.match(/NSC_TOKEN_FILE: \$\{\{ steps\.namespace\.outputs\.token-file \}\}/g),
+		).toHaveLength(3);
+		expect(workflowText).not.toContain("id: nsc-token");
+		expect(workflowText).not.toContain("id: nsc-setup");
+		expect(workflowText).not.toMatch(/run: \|\s*\n\s*nsc token create/);
+	});
+
+	test("the composite explicitly bounds each minted token to the benchmark cell window", () => {
+		const action = readFileSync(
+			join(findRepoRoot(), ".github/actions/namespace-token/action.yml"),
+			"utf8",
+		);
+		expect(action).toContain("--expires_in 4h");
+		expect(action).not.toContain("--no_expiry");
+	});
+});
+
+describe("run.cloud credential scoping", () => {
+	test("the promote step exposes the key only when the resolved plan contains runcloud", () => {
+		const doc = readWorkflow(`${WORKFLOWS_DIR}/${TOOLCHAIN_WORKFLOW}`);
+		const publish = workflowJob(doc, "publish", TOOLCHAIN_WORKFLOW);
+		// Exactly one assignment anywhere in the publish job, and its entire value is the plan gate. This
+		// rejects every unscoped spelling (including `secrets.RUN_CLOUD_API_KEY || ''`) rather than one
+		// fragile literal while ignoring a second assignment in another step or at job scope.
+		expect(valuesForKey(publish, "RUN_CLOUD_API_KEY")).toEqual([SCOPED_RUNCLOUD_KEY]);
+	});
+});
+
+describe("Runloop credential scoping", () => {
+	test("the promote step exposes the key only when the resolved plan contains runloop", () => {
+		const doc = readWorkflow(`${WORKFLOWS_DIR}/${TOOLCHAIN_WORKFLOW}`);
+		const publish = workflowJob(doc, "publish", TOOLCHAIN_WORKFLOW);
+		expect(valuesForKey(publish, "RUNLOOP_API_KEY")).toEqual([SCOPED_RUNLOOP_KEY]);
+	});
+});
+
+describe("toolchain bake base-image selection", () => {
+	test("threads one immutable source through every bake cell and the Vercel mirror", () => {
+		const doc = readWorkflow(`${WORKFLOWS_DIR}/${TOOLCHAIN_WORKFLOW}`);
+		const env = stepEnv(doc, "bake", "Bake + verify candidate", TOOLCHAIN_WORKFLOW);
+		expect(env.BASE_IMAGE_REF).toBe(SELECTED_BASE_IMAGE);
+		const mirrorEnv = stepEnv(
+			doc,
+			"bake",
+			"Mirror the toolchain base into VCR",
+			TOOLCHAIN_WORKFLOW,
+		);
+		expect(mirrorEnv.SOURCE_REF).toBe(SELECTED_BASE_IMAGE);
+		const step = stepByName(
+			workflowJob(doc, "bake", TOOLCHAIN_WORKFLOW),
+			"Bake + verify candidate",
+			TOOLCHAIN_WORKFLOW,
+		);
+		expect(step?.run).toContain(BASE_IMAGE_ARG);
 	});
 });
 
@@ -449,6 +598,84 @@ describe("checkToolchainDispatchOnly", () => {
 			jobs: { publish: gatedPublish },
 		};
 		expect(checkToolchainDispatchOnly(arrayForm, TOOLCHAIN_WORKFLOW)).toEqual([]);
+	});
+});
+
+describe("checkToolchainPrScope", () => {
+	const imageDoc = (paths: readonly string[] = TOOLCHAIN_IMAGE_PR_PATHS) => ({
+		on: { pull_request: { paths: [...paths] } },
+	});
+	const actionSmokeDoc = ({
+		paths = TOOLCHAIN_ACTION_SMOKE_PR_PATHS,
+		buildx = "true",
+		summaryIf = "always()",
+		run = `test "$(bun --version)" = "1.4.0"
+test "$(tama --version | awk '{print $2}')" = "0.1.17"
+bun packages/templates/src/pins.ts >/dev/null
+docker buildx inspect --bootstrap`,
+		tama = true,
+	}: {
+		paths?: readonly string[];
+		buildx?: string;
+		summaryIf?: string;
+		run?: string;
+		tama?: boolean;
+	} = {}) => ({
+		on: { pull_request: { paths: [...paths] } },
+		jobs: {
+			smoke: {
+				if: "github.event.pull_request.head.repo.full_name == github.repository",
+				"runs-on": "starsling-ubuntu-24.04-2",
+				"timeout-minutes": 5,
+				steps: [
+					{ uses: "./.github/actions/setup-toolchain", with: { buildx } },
+					...(tama ? [{ uses: "./.github/actions/setup-tama" }] : []),
+					{ run },
+					{ uses: "./.github/actions/release-summary", if: summaryIf },
+				],
+			},
+		},
+	});
+
+	test("passes the real expensive and lightweight toolchain workflows", () => {
+		expect(
+			checkToolchainPrScope(
+				readWorkflow(`${WORKFLOWS_DIR}/${TOOLCHAIN_WORKFLOW}`),
+				readWorkflow(`${WORKFLOWS_DIR}/${TOOLCHAIN_ACTION_SMOKE_WORKFLOW}`),
+			),
+		).toEqual([]);
+	});
+
+	test("rejects a broad action glob on the expensive image workflow", () => {
+		const errors = checkToolchainPrScope(
+			imageDoc([...TOOLCHAIN_IMAGE_PR_PATHS, ".github/actions/**"]),
+			actionSmokeDoc(),
+		);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain(".github/actions/**");
+	});
+
+	test("rejects missing transitive action ownership and weakened runtime coverage", () => {
+		const paths = TOOLCHAIN_ACTION_SMOKE_PR_PATHS.filter(
+			(path) => path !== ".github/actions/setup-workspace/**",
+		);
+		const errors = checkToolchainPrScope(
+			imageDoc(),
+			actionSmokeDoc({
+				paths,
+				buildx: "false",
+				summaryIf: "success()",
+				run: "bun --version",
+				tama: false,
+			}),
+		);
+		expect(errors.some((error) => error.includes("setup-workspace/**"))).toBe(true);
+		expect(errors.some((error) => error.includes('buildx: "true"'))).toBe(true);
+		expect(errors.some((error) => error.includes("if: always()"))).toBe(true);
+		expect(errors.some((error) => error.includes("setup-tama"))).toBe(true);
+		expect(errors.some((error) => error.includes("tama --version"))).toBe(true);
+		expect(errors.some((error) => error.includes("packages/templates/src/pins.ts"))).toBe(true);
+		expect(errors.some((error) => error.includes("docker buildx inspect --bootstrap"))).toBe(true);
 	});
 });
 

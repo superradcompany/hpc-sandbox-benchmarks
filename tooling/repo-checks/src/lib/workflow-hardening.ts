@@ -15,6 +15,8 @@
 //      A reusable-workflow caller (`uses:` job) can't declare `environment:`; a LOCAL call defers the
 //      gate to the called file (checked here in its own right), a REMOTE one is flagged (unverifiable).
 //   4. Toolchain publish is dispatch-only — toolchain-image.yml must not fire a release on push/merge.
+//   5. Toolchain PR ownership stays split — image inputs run the expensive docker smoke, while the
+//      three setup/reporting composites run a lightweight smoke on the standard 2-vCPU runner.
 //
 // Bun.YAML.parse is built into bun >= 1.3 (no new dependency).
 import { readFileSync } from "node:fs";
@@ -25,6 +27,23 @@ import { findRepoRoot } from "./workspace.ts";
 export const WORKFLOWS_DIR = ".github/workflows";
 export const CI_LINT_WORKFLOW = ".github/workflows/ci-lint.yml";
 export const TOOLCHAIN_WORKFLOW = "toolchain-image.yml";
+export const TOOLCHAIN_ACTION_SMOKE_WORKFLOW = "toolchain-actions-smoke.yml";
+
+/** Inputs that can alter the toolchain image and therefore own the expensive PR docker smoke. */
+export const TOOLCHAIN_IMAGE_PR_PATHS = [
+	"packages/templates/**",
+	"packages/schema/src/toolchain.ts",
+	".github/workflows/toolchain-image.yml",
+] as const;
+
+/** Local setup composites executed by the lightweight smoke, plus the smoke itself. */
+export const TOOLCHAIN_ACTION_SMOKE_PR_PATHS = [
+	".github/actions/setup-tama/**",
+	".github/actions/setup-toolchain/**",
+	".github/actions/setup-workspace/**",
+	".github/actions/release-summary/**",
+	".github/workflows/toolchain-actions-smoke.yml",
+] as const;
 
 /** GitHub Environment name that holds provider secrets and gates releases. See docs/ci-secrets.md. */
 export const PRIVILEGED_ENVIRONMENT = "privileged";
@@ -183,7 +202,11 @@ export function checkCiLintGate(doc: unknown, label: string = CI_LINT_WORKFLOW):
 		}
 		// Job existence isn't enough: it must actually invoke the tool, or the gate false-passes if
 		// the real invocation is renamed/removed while an empty job shell survives.
-		if (!jobRun(tool).includes(tool)) {
+		const run = jobRun(tool);
+		const queueCompatibleActionlint =
+			tool === "actionlint" &&
+			run.split("\n").some((line) => line.trim() === "bun run lint:workflows");
+		if (!run.includes(tool) && !queueCompatibleActionlint) {
 			errors.push(
 				`${label}: the "${tool}" job must actually run \`${tool}\` — the gate must not pass on a job that no longer invokes it`,
 			);
@@ -309,16 +332,37 @@ function privilegeReasons(f: {
 
 /** True if any job in a parsed workflow declares `environment: <privileged>`. Used to confirm a local
  *  reusable workflow carries its own approval gate (the caller can't declare one for it). */
-function hasPrivilegedJob(doc: unknown, privileged: string): boolean {
-	const root = asRecord(doc, "reusable workflow: not a YAML mapping");
-	const jobs = asRecord(root.jobs, "reusable workflow: no jobs mapping");
-	return Object.values(jobs).some(
-		(j) =>
-			j !== null &&
-			typeof j === "object" &&
-			!Array.isArray(j) &&
-			jobEnvironmentName(j as Record<string, unknown>) === privileged,
+function hasPrivilegedJob(
+	doc: unknown,
+	privileged: string,
+	resolveLocal: (path: string) => unknown,
+	visited = new Set<string>(),
+): boolean {
+	const root = asRecord(doc, "reusable workflow");
+	const jobs = Object.values(asRecord(root.jobs, "reusable jobs")).map((job) =>
+		asRecord(job, "reusable job"),
 	);
+	const nested = jobs.filter((job) => typeof job.uses === "string");
+	const directGate = jobs.some((job) => jobEnvironmentName(job) === privileged);
+	if (nested.length === 0) return directGate;
+	return nested.every((job) => {
+		if (
+			typeof job.uses !== "string" ||
+			!job.uses.startsWith("./.github/workflows/") ||
+			visited.has(job.uses)
+		)
+			return false;
+		try {
+			return hasPrivilegedJob(
+				resolveLocal(job.uses.slice(2)),
+				privileged,
+				resolveLocal,
+				new Set([...visited, job.uses]),
+			);
+		} catch {
+			return false;
+		}
+	});
 }
 
 /**
@@ -392,7 +436,10 @@ export function checkPrivilegedEnvironment(
 			} catch {
 				calledDoc = undefined;
 			}
-			if (calledDoc !== undefined && !hasPrivilegedJob(calledDoc, privileged)) {
+			if (
+				calledDoc !== undefined &&
+				!hasPrivilegedJob(calledDoc, privileged, resolveLocalWorkflow)
+			) {
 				errors.push(
 					`${key}: calls local reusable workflow ${job.uses} with ${reasons.join(" and ")} but no ` +
 						`job in it sets \`environment: ${privileged}\` — a \`uses:\` caller can't gate itself, so ` +
@@ -489,6 +536,120 @@ export function checkToolchainDispatchOnly(
 	return errors;
 }
 
+function pullRequestPaths(doc: unknown, file: string): string[] {
+	const root = asRecord(doc, `${file}: not a YAML mapping`);
+	const triggers = asRecord(root.on, `${file}: missing or malformed \`on:\` trigger map`);
+	const pullRequest = asRecord(
+		triggers.pull_request,
+		`${file}: missing or malformed \`pull_request:\` trigger`,
+	);
+	if (
+		!Array.isArray(pullRequest.paths) ||
+		!pullRequest.paths.every((path) => typeof path === "string")
+	) {
+		throw new Error(`${file}: \`pull_request.paths\` must be a string list`);
+	}
+	return pullRequest.paths;
+}
+
+function exactSetError(
+	actual: readonly string[],
+	expected: readonly string[],
+	label: string,
+): string | undefined {
+	const sortedActual = [...actual].sort();
+	const sortedExpected = [...expected].sort();
+	if (JSON.stringify(sortedActual) === JSON.stringify(sortedExpected)) return undefined;
+	return `${label} must be exactly [${expected.join(", ")}], got [${actual.join(", ")}]`;
+}
+
+/**
+ * Invariant 5: image inputs own the expensive toolchain PR smoke; the CLI/setup/reporting composites
+ * own a bounded smoke on the standard runner. This prevents a broad action glob from turning every
+ * later push in an action-touching PR into another PTS-heavy image build.
+ */
+export function checkToolchainPrScope(
+	toolchainDoc: unknown,
+	actionSmokeDoc: unknown,
+	toolchainFile: string = TOOLCHAIN_WORKFLOW,
+	actionSmokeFile: string = TOOLCHAIN_ACTION_SMOKE_WORKFLOW,
+): string[] {
+	const errors: string[] = [];
+	const imagePathError = exactSetError(
+		pullRequestPaths(toolchainDoc, toolchainFile),
+		TOOLCHAIN_IMAGE_PR_PATHS,
+		`${toolchainFile}: \`pull_request.paths\``,
+	);
+	if (imagePathError !== undefined) errors.push(imagePathError);
+
+	const actionPathError = exactSetError(
+		pullRequestPaths(actionSmokeDoc, actionSmokeFile),
+		TOOLCHAIN_ACTION_SMOKE_PR_PATHS,
+		`${actionSmokeFile}: \`pull_request.paths\``,
+	);
+	if (actionPathError !== undefined) errors.push(actionPathError);
+
+	const root = asRecord(actionSmokeDoc, `${actionSmokeFile}: not a YAML mapping`);
+	const jobs = asRecord(root.jobs, `${actionSmokeFile}: no jobs mapping`);
+	const smoke = asRecord(jobs.smoke, `${actionSmokeFile}: missing or malformed "smoke" job`);
+	const jobLabel = `${actionSmokeFile}::smoke`;
+	if (
+		smoke["runs-on"] !== "starsling-ubuntu-24.04-2" &&
+		smoke["runs-on"] !==
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Literal GitHub Actions expression.
+			"${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}"
+	) {
+		errors.push(`${jobLabel}: must use the standard 2-vCPU runner \`starsling-ubuntu-24.04-2\``);
+	}
+	if (smoke["timeout-minutes"] !== 5) {
+		errors.push(`${jobLabel}: must keep \`timeout-minutes: 5\` to bound runner spend`);
+	}
+	if (smoke.if !== "github.event.pull_request.head.repo.full_name == github.repository") {
+		errors.push(`${jobLabel}: must keep the same-repository guard before executing PR code`);
+	}
+
+	if (!Array.isArray(smoke.steps)) {
+		throw new Error(`${jobLabel}: steps must be a list`);
+	}
+	const steps = smoke.steps.map((step) => asRecord(step, `${jobLabel}: malformed step`));
+	const setup = steps.find((step) => step.uses === "./.github/actions/setup-toolchain");
+	if (setup === undefined) {
+		errors.push(`${jobLabel}: must execute ./.github/actions/setup-toolchain`);
+	} else {
+		const withBlock = asRecord(setup.with, `${jobLabel}: setup-toolchain has malformed \`with:\``);
+		if (withBlock.buildx !== "true") {
+			errors.push(`${jobLabel}: setup-toolchain must pass \`buildx: "true"\``);
+		}
+	}
+	if (!steps.some((step) => step.uses === "./.github/actions/setup-tama")) {
+		errors.push(`${jobLabel}: must execute ./.github/actions/setup-tama`);
+	}
+	const summary = steps.find((step) => step.uses === "./.github/actions/release-summary");
+	if (summary === undefined) {
+		errors.push(`${jobLabel}: must execute ./.github/actions/release-summary`);
+	} else if (summary.if !== "always()") {
+		errors.push(`${jobLabel}: release-summary must use \`if: always()\` so failures are reported`);
+	}
+
+	const runText = steps
+		.map((step) => step.run)
+		.filter((run): run is string => typeof run === "string")
+		.join("\n");
+	for (const probe of [
+		"bun --version",
+		"1.4.0",
+		"tama --version",
+		"0.1.17",
+		"bun packages/templates/src/pins.ts",
+		"docker buildx inspect --bootstrap",
+	] as const) {
+		if (!runText.includes(probe)) {
+			errors.push(`${jobLabel}: runtime probe is missing \`${probe}\``);
+		}
+	}
+	return errors;
+}
+
 /** The whole gate against the real .github files under `root`. */
 export function runHardeningCheck(root: string = findRepoRoot()): string[] {
 	const files = listWorkflowFiles(root);
@@ -526,6 +687,19 @@ export function runHardeningCheck(root: string = findRepoRoot()): string[] {
 		errors.push(`${TOOLCHAIN_WORKFLOW}: missing from ${WORKFLOWS_DIR}`);
 	} else {
 		errors.push(...checkToolchainDispatchOnly(toolchainDoc, TOOLCHAIN_WORKFLOW));
+		const actionSmokeDoc = docs.get(TOOLCHAIN_ACTION_SMOKE_WORKFLOW);
+		if (actionSmokeDoc === undefined) {
+			errors.push(`${TOOLCHAIN_ACTION_SMOKE_WORKFLOW}: missing from ${WORKFLOWS_DIR}`);
+		} else {
+			errors.push(
+				...checkToolchainPrScope(
+					toolchainDoc,
+					actionSmokeDoc,
+					TOOLCHAIN_WORKFLOW,
+					TOOLCHAIN_ACTION_SMOKE_WORKFLOW,
+				),
+			);
+		}
 	}
 	return errors;
 }

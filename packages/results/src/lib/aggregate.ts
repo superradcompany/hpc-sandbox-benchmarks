@@ -21,17 +21,23 @@ import type {
 	MetricReplicate,
 	MetricResult,
 	ObservedSpecs,
+	ProviderArtifactEvidence,
+	ProviderCostEvidence,
 	ProviderRun,
 	ResultGap,
 	Run,
+	TargetSpec,
 	UncataloguedResult,
 } from "@sandbox-benchmarks/schema";
 import {
 	aggregate,
+	canonicalJsonString,
 	deriveEconomics,
 	getProvider,
 	isDerivedMetric,
+	PROVIDER_EVIDENCE_JSON_LIMITS,
 	parseRun,
+	providerCostCellKey,
 	providerReportedNothing,
 } from "@sandbox-benchmarks/schema";
 import type { HostMetadataRecordInput, ObservedMixtureIds } from "./observed-mixtures.ts";
@@ -137,7 +143,12 @@ function foldVerdict(current: boolean | undefined, next: boolean | undefined): b
 }
 
 /** Merge one provider's slices across every replicate shard that carried it. */
-function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): ProviderRun {
+function mergeProvider(
+	providerId: string,
+	entries: readonly ReplicateSlice[],
+	targetSpec: TargetSpec,
+	emitArtifactEvidence: boolean,
+): ProviderRun {
 	// Group measured metrics by id, then by the replicate that produced them, carrying that sandbox's
 	// mixture ids in the SAME record. A metric id recurring across replicate shards is R distinct
 	// sandboxes (folded into the replicate structure below); a metric id recurring WITHIN one replicate is
@@ -167,6 +178,10 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 	// One entry per (record, sandbox), folded below. Collected raw rather than deduped here because the
 	// fold needs the machine each record was read on, which only the slice knows.
 	const hostMetadataInputs: HostMetadataRecordInput[] = [];
+	const evidenceByCell = new Map<string, ProviderCostEvidence>();
+	const sandboxCells = new Map<string, string>();
+	const artifactByCell = new Map<string, ProviderArtifactEvidence>();
+	const artifactSandboxCells = new Map<string, string>();
 
 	// ONE pass over the slices. The mixture ids are two sha256 hashes per slice, and a real run merges
 	// ~470 slices per provider (the normalizer's placeholder rows included), so deriving them once here
@@ -174,7 +189,57 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 	for (const { slice, replicateIndex } of entries) {
 		const ids = observedMixtureIds(slice.observedSpecs);
 		if (!providerReportedNothing(slice)) sandboxSpecReadings.push(slice.observedSpecs);
+		// Preserve the complete provider probe record here: foldHostMetadata removes only volatile
+		// timestamps, so exact isolation fields (runtime, VMM, confidence, scores, and evidence)
+		// remain available to figure generation after shards are merged.
 		for (const record of slice.hostMetadata ?? []) hostMetadataInputs.push({ record, ids });
+		for (const record of slice.costEvidence ?? []) {
+			const key = providerCostCellKey(record);
+			const existing = evidenceByCell.get(key);
+			// Canonicalization is needed only for duplicate candidates; one-record cells stay on the
+			// allocation-free common path.
+			if (existing !== undefined) {
+				if (
+					canonicalJsonString(existing, PROVIDER_EVIDENCE_JSON_LIMITS) !==
+					canonicalJsonString(record, PROVIDER_EVIDENCE_JSON_LIMITS)
+				) {
+					throw new Error(`aggregateRuns: conflicting provider cost evidence for cell ${key}`);
+				}
+			} else {
+				evidenceByCell.set(key, record);
+			}
+			const sandboxId = record.subject.sandboxId;
+			if (sandboxId !== undefined) {
+				const priorCell = sandboxCells.get(sandboxId);
+				if (priorCell !== undefined && priorCell !== key) {
+					throw new Error(
+						`aggregateRuns: provider cost sandbox ${sandboxId} is reused across cells`,
+					);
+				}
+				sandboxCells.set(sandboxId, key);
+			}
+		}
+		for (const record of slice.artifactEvidence ?? []) {
+			const key = providerCostCellKey(record);
+			const existing = artifactByCell.get(key);
+			if (existing !== undefined) {
+				if (
+					canonicalJsonString(existing, PROVIDER_EVIDENCE_JSON_LIMITS) !==
+					canonicalJsonString(record, PROVIDER_EVIDENCE_JSON_LIMITS)
+				) {
+					throw new Error(`aggregateRuns: conflicting provider artifact evidence for cell ${key}`);
+				}
+			} else {
+				artifactByCell.set(key, record);
+			}
+			const priorCell = artifactSandboxCells.get(record.sandboxId);
+			if (priorCell !== undefined && priorCell !== key) {
+				throw new Error(
+					`aggregateRuns: provider artifact sandbox ${record.sandboxId} is reused across cells`,
+				);
+			}
+			artifactSandboxCells.set(record.sandboxId, key);
+		}
 		for (const suite of slice.suitesCovered) suitesCovered.add(suite);
 
 		for (const metric of slice.metrics) {
@@ -249,6 +314,20 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 
 	// Fold host records by (source, file, non-volatile fields, machine) with a sandbox count.
 	const hostMetadata = foldHostMetadata(hostMetadataInputs);
+	const costEvidence = [...evidenceByCell.values()].sort((a, b) => {
+		const suite = a.cell.suite.localeCompare(b.cell.suite, "en");
+		if (suite !== 0) return suite;
+		const replicate = (a.cell.replicateIndex ?? -1) - (b.cell.replicateIndex ?? -1);
+		if (replicate !== 0) return replicate;
+		return (a.subject.sandboxId ?? "").localeCompare(b.subject.sandboxId ?? "", "en");
+	});
+	const artifactEvidence = [...artifactByCell.values()].sort((a, b) => {
+		const suite = a.cell.suite.localeCompare(b.cell.suite, "en");
+		if (suite !== 0) return suite;
+		const replicate = (a.cell.replicateIndex ?? -1) - (b.cell.replicateIndex ?? -1);
+		if (replicate !== 0) return replicate;
+		return a.sandboxId.localeCompare(b.sandboxId, "en");
+	});
 
 	const metrics = [...measured.values()];
 	// Re-derive economics from the FULL merged measured set so $/lifecycle sums every suite's timings,
@@ -260,6 +339,8 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 			...deriveEconomics(
 				meta,
 				metrics.map((m) => ({ metricId: m.metricId, mean: m.aggregates.mean })),
+				undefined,
+				targetSpec,
 			),
 		);
 	}
@@ -267,6 +348,8 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 
 	return {
 		providerId,
+		costEvidence,
+		...(emitArtifactEvidence ? { artifactEvidence } : {}),
 		validationStatus: metrics.length > 0 ? "validated" : "pending",
 		...(specMatched !== undefined ? { specMatched } : {}),
 		observedSpecs,
@@ -281,19 +364,38 @@ function mergeProvider(providerId: string, entries: readonly ReplicateSlice[]): 
 
 /**
  * Merge the per-shard Runs of one benchmark run into a single validated Run. All shards must share
- * `runId` and `sha` (they are slices of one run); `generatedAt` resolves to the latest shard's. Throws
- * on an empty input or a shard-identity mismatch, and validates the merged Run at the boundary.
+ * `runId`, `sha`, and `targetSpec` (they are slices of one run); `generatedAt` resolves to the latest
+ * shard's. Throws on an empty input or a shard-identity/target mismatch, and validates the merged Run
+ * at the boundary.
  */
 export function aggregateRuns(runs: readonly Run[]): Run {
+	if (runs.some((run) => run.experiment !== undefined)) {
+		throw new Error(
+			"aggregateRuns cannot merge completed experiments; use original planned attempts to preserve eligibility and provenance",
+		);
+	}
 	if (runs.length === 0) {
 		throw new Error("aggregateRuns requires at least one shard Run");
 	}
 	const first = runs[0];
 	if (!first) throw new Error("aggregateRuns requires at least one shard Run");
+	const emitArtifactEvidence = runs.every((run) => Number(run.schemaVersion) >= 6);
+	if (!emitArtifactEvidence && runs.some((run) => Number(run.schemaVersion) >= 6)) {
+		throw new Error("aggregateRuns: cannot mix v6 artifact-attributed shards with older shards");
+	}
 	for (const run of runs) {
 		if (run.runId !== first.runId || run.sha !== first.sha) {
 			throw new Error(
 				`aggregateRuns: shard identity mismatch — expected runId=${first.runId} sha=${first.sha}, got runId=${run.runId} sha=${run.sha}`,
+			);
+		}
+		if (
+			run.targetSpec.vcpus !== first.targetSpec.vcpus ||
+			run.targetSpec.memoryGb !== first.targetSpec.memoryGb ||
+			run.targetSpec.diskGb !== first.targetSpec.diskGb
+		) {
+			throw new Error(
+				`aggregateRuns: shard target spec mismatch — expected ${JSON.stringify(first.targetSpec)}, got ${JSON.stringify(run.targetSpec)}`,
 			);
 		}
 	}
@@ -314,6 +416,8 @@ export function aggregateRuns(runs: readonly Run[]): Run {
 					.filter((p) => p.providerId === id)
 					.map((slice) => ({ slice, replicateIndex: run.replicateIndex ?? 0 })),
 			),
+			first.targetSpec,
+			emitArtifactEvidence,
 		),
 	);
 
@@ -324,12 +428,13 @@ export function aggregateRuns(runs: readonly Run[]): Run {
 	const sourceRunUrl = runs.find((run) => run.sourceRunUrl !== undefined)?.sourceRunUrl;
 
 	// The merged Run spans every replicate, so it carries no single `replicateIndex` — that lived on the
-	// shards. Emit v4: this is the only layer that sees every sandbox's reading at once, so it is the only
+	// shards. Emit v6 only when every shard carries artifact attribution; historical all-pre-v6
+	// inputs continue to aggregate as v5 without fabricating evidence.
 	// one that can emit `observedMixtures`, join each replicate to the mixture its sandbox reported, and
 	// fold the host records. v2/v3 shards read in above validate unchanged, and the v4 document still
 	// carries the v3 replicate fold (version floors compare numerically in runSchema).
 	return parseRun({
-		schemaVersion: "4",
+		schemaVersion: emitArtifactEvidence ? "6" : "5",
 		runId: first.runId,
 		sha: first.sha,
 		generatedAt,

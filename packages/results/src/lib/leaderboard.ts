@@ -14,12 +14,14 @@
  * and {@link SYNTHETIC_DIMENSIONS}. Which sections exist stays driven by the data — a Dimension no
  * provider emitted is absent, collapsed or not.
  *
- * Ranking is INFERENTIAL, not a bare sort. A provider's Samples are repeated trials inside one sandbox,
- * so their spread is environmental noise, and ordering on the median alone would let a lucky draw buy a
- * position: a live run had modal's STREAM Copy span 9.7k–65k MB/s against daytona's 66.5k ±0.14%. Each
- * row therefore carries a bootstrapped interval around its median, and two rows share a rank unless
- * their full distributions separate under Mann-Whitney U (with Kolmogorov-Smirnov reported alongside,
- * since a bimodal provider can match another's median while behaving nothing like it).
+ * Ranking is INFERENTIAL, not a bare sort, and the unit it reasons about is the SANDBOX. A provider is
+ * measured on R independent sandboxes, each running k trials; trials capture within-machine noise while
+ * sandboxes capture the machine-to-machine variation a user meets on every fresh environment. Ordering
+ * on a median alone would let a lucky draw buy a position: a live run had modal's STREAM Copy span
+ * 9.7k–65k MB/s against daytona's 66.5k ±0.14%. So each row carries a cluster-bootstrapped interval
+ * around the median of its per-sandbox medians, and two rows share a rank unless their per-sandbox
+ * medians separate under Mann-Whitney U (with Kolmogorov-Smirnov reported alongside, since a bimodal
+ * provider can match another's median while behaving nothing like it).
  */
 import type {
 	Dimension,
@@ -33,18 +35,19 @@ import type {
 	TargetSpec,
 } from "@sandbox-benchmarks/schema";
 import {
-	bootstrapMedianDifferenceInterval,
 	bootstrapMedianInterval,
 	canSeparate,
+	clusterMedianInterval,
+	clusterSeparation,
 	DEFAULT_ALPHA,
 	DIMENSIONS,
 	getProvider,
-	hierarchicalBootstrapMedianInterval,
 	kolmogorovSmirnov,
 	METRIC_CATALOG,
 	mannWhitneyU,
 	providerReportedNothing,
 	SUITE_NAMES,
+	sandboxMedianOf,
 } from "@sandbox-benchmarks/schema";
 
 /**
@@ -91,22 +94,83 @@ export const LEADERBOARD_DIMENSION_ORDER: readonly Dimension[] = [
 	...DIMENSIONS.filter((dimension) => dimension !== "realworld"),
 ];
 
+/**
+ * The Dimension whose section leads with FIGURES instead of tables. See
+ * {@link renderLeaderboardMarkdown} on why the tables then collapse rather than disappear.
+ *
+ * A constant rather than a literal in two places: the renderer branches on it and
+ * `tooling/repo-checks/src/leaderboard-artifact-sync.test.ts` asserts the resulting layout, and a
+ * gate holding its own copy of "which dimension is special" stops checking the renderer the moment
+ * the renderer changes its mind.
+ */
+export const FIGURE_DIMENSION: Dimension = "realworld";
+
+/**
+ * One rendered suite chart the Markdown embeds — what the renderer needs in order to link a figure
+ * it did not produce.
+ *
+ * The renderer takes these as an ARGUMENT rather than deriving them, and the argument is required
+ * rather than defaulted. Which suites are chartable is a decision the figure pipeline makes from
+ * the run (it needs two environments that completed every exercised task), so re-deriving it here
+ * would be a second copy of that rule, free to disagree — and the way it would disagree is by
+ * linking an image nobody wrote, which renders as a broken image on the published page and as a
+ * passing test in CI. Handing over the list that was actually rendered makes that impossible: the
+ * writer and the linker read the same array.
+ */
+export interface LeaderboardFigure {
+	/** The suite's registry id, e.g. `realworld-better-auth`. */
+	readonly suiteId: string;
+	/** Display name for the alt text, e.g. `Better-Auth`. */
+	readonly suiteName: string;
+	/** Path the Markdown links, relative to the directory holding it. */
+	readonly file: string;
+	/** Display width in CSS px. The committed WebP is rasterised at 2× this, so the `<img>`
+	 *  tag must say the logical width or GitHub shows the chart at double size. */
+	readonly width: number;
+	/** Environments charted, and those the chart discloses as not having completed the suite. */
+	readonly charted: number;
+	readonly incomplete: number;
+	readonly tasks: number;
+}
+
 /** One provider's standing on one Metric. */
 export interface LeaderboardRow {
 	providerId: string;
 	displayName: string;
-	/** Representative value (Samples' p50) of the Metric for this provider. */
+	/**
+	 * Representative value of the Metric for this provider: with replicate sandboxes, the median of the
+	 * PER-SANDBOX medians (one machine one vote — NOT `aggregates.p50`, which weights each machine by its
+	 * trial count); without them, the p50 of that single sandbox's Samples.
+	 */
 	value: number;
 	/**
-	 * 1-based rank by the Metric's Direction. Providers whose Sample distributions are NOT
-	 * distinguishable (Mann-Whitney U, two-sided, α = {@link DEFAULT_ALPHA}) share a rank: a faster
-	 * median earned inside the noise is not a faster provider.
+	 * 1-based rank by the Metric's Direction. Providers that are NOT distinguishable share a rank: a
+	 * faster median earned inside the noise is not a faster provider. The deciding test is the
+	 * SANDBOX-LEVEL one wherever replicate sandboxes exist — Mann-Whitney U (two-sided,
+	 * α = {@link DEFAULT_ALPHA}) on each side's per-sandbox medians, whole machines as the exchangeable
+	 * unit; only where both sides ran in a single sandbox does it fall back to Mann-Whitney on the pooled
+	 * trials. See {@link pVsPrevious} for which one decided a given row.
 	 */
 	rank: number;
-	/** Descriptive percentile-bootstrap interval around {@link value}. */
+	/**
+	 * Descriptive bootstrap interval around {@link value}, over the same estimand. NOT a calibrated
+	 * interval at small R: simulated coverage of a nominal 95% is ≈77% at R=3, ≈92% at R=6, ≈95% at R=20.
+	 * That is a property of the sandbox count, not of the method — renderers must disclose it.
+	 */
 	interval: MedianInterval;
-	/** Retained Sample count and their spread, so a wide/unstable row is legible at a glance. */
+	/**
+	 * Retained TRIAL count pooled across sandboxes, and their spread. `n` is not the unit of replication
+	 * and must never be rendered as if it were: {@link sandboxes} is. Under convergence a large `n` is
+	 * evidence the machines were UNSTABLE (PTS kept re-running), not that the estimate is precise.
+	 */
 	n: number;
+	/** Replicate sandboxes behind {@link value} — the actual unit of replication. `null` at R=1. */
+	sandboxes: number | null;
+	/**
+	 * Sample standard deviation of the POOLED trials, so it conflates between-machine and within-machine
+	 * variance (measured median ICC 0.53 — roughly half of it is within-machine). Not rendered anywhere
+	 * for exactly that reason; do not surface it without decomposing it first.
+	 */
 	stdev: number;
 	/**
 	 * Two-sided p-values against the row immediately above (`null` for rank 1, which has no predecessor).
@@ -117,7 +181,19 @@ export interface LeaderboardRow {
 	 * Both are rendered: `mannWhitney` as `p vs. above`, `ks` as `p (KS)`. Only `mannWhitney` decides the
 	 * rank; `ks` is shown so a reader can see the two disagree.
 	 */
-	pVsPrevious: { mannWhitney: number; ks: number; floor: number } | null;
+	pVsPrevious: {
+		mannWhitney: number;
+		ks: number;
+		floor: number;
+		/**
+		 * The test that ACTUALLY decided {@link verdict}, when the sandbox-level path decided it. Carried
+		 * separately because the two floors differ by orders of magnitude and quoting the wrong one made
+		 * the published footnote self-refuting: it asserted "the best attainable p already exceeds α" while
+		 * printing the POOLED floor of <0.001. `null` when the pooled Mann-Whitney above decided (R=1 both
+		 * sides), in which case `mannWhitney`/`floor` are the deciding numbers.
+		 */
+		cluster: { p: number; floor: number; sandboxesA: number; sandboxesB: number } | null;
+	} | null;
 	/**
 	 * What the test said about this row and the one above it (`null` for rank 1, which has nothing above):
 	 *
@@ -234,6 +310,7 @@ export interface AbsentProvider {
 /** The full comparison surface derived from one Run. */
 export interface Leaderboard {
 	runId: string;
+	comparisonCohort?: string;
 	sha: string;
 	generatedAt: string;
 	/** The requested comparison target recorded on this Run — never substituted from global config. */
@@ -401,16 +478,25 @@ function rankMetric(run: Run, metric: MetricDef): LeaderboardRow[] {
 		const row: LeaderboardRow = {
 			providerId: provider.providerId,
 			displayName: getProvider(provider.providerId)?.displayName ?? provider.providerId,
-			value: result.aggregates.p50,
+			// ONE MACHINE, ONE VOTE. With replicate sandboxes the ranking value is the median of the
+			// per-sandbox medians, not `aggregates.p50` (the median of the POOLED trials). Pooling weights
+			// each sandbox by its trial count, and PTS convergence sets that count by watching the variance,
+			// so the noisiest machine earned the most votes: on the committed data ρ(trials, within-sandbox
+			// CV) = 0.76, and one headline row published 20.99 from sandbox medians {18.87, 21.06, 18.95}
+			// because the 15-pass machine held 71% of the weight. The pooled Samples stay in the dataset as
+			// the raw evidence; they are no longer the ranking statistic.
+			value: replicates ? sandboxMedianOf(replicates) : result.aggregates.p50,
 			rank: 0, // assigned after sort
 			// Seed from stable identity so a committed leaderboard is byte-identical on every regeneration —
-			// a Math.random() bootstrap would churn the diff on every run. With replicate sandboxes the
-			// interval is the HIERARCHICAL bootstrap (resample sandboxes, then samples within), reflecting
-			// between-sandbox variance; at R=1 it stays the ordinary percentile bootstrap, byte-for-byte.
+			// a Math.random() bootstrap would churn the diff on every run. The interval is the CLUSTER
+			// bootstrap of that same statistic (resample sandboxes intact), so estimate and interval share
+			// an estimand; at R=1 there is no between-machine information and it stays the ordinary
+			// percentile bootstrap over the single sandbox's trials.
 			interval: replicates
-				? hierarchicalBootstrapMedianInterval(replicates, { seed })
+				? clusterMedianInterval(replicates, { seed })
 				: bootstrapMedianInterval(result.samples, { seed }),
 			n: result.aggregates.n,
+			sandboxes: replicates?.length ?? null,
 			stdev: result.aggregates.stdev,
 			pVsPrevious: null,
 			verdict: null,
@@ -475,35 +561,48 @@ function rankMetric(run: Run, metric: MetricDef): LeaderboardRow[] {
 			mannWhitney: mw.pValue,
 			ks: ks.pValue,
 			floor: mw.minAttainablePValue,
+			// Filled in below when the sandbox-level test decides; stays null on the R=1 path.
+			cluster: null,
 		};
 
 		// Replicate-aware separation: when EITHER row carries ≥2 replicate sandboxes, the decider is the
-		// EXACT cluster-level rank permutation inside bootstrapMedianDifferenceInterval — Mann-Whitney U on
-		// the per-sandbox medians, whole sandboxes the exchangeable unit. That is cluster-honest where MW on
-		// samples pooled across replicates is anti-conservative, and it carries the real 2/C(2R,R) floor, so
-		// small R reads as UNDERPOWERED rather than a false tie or a false separation. A row with no
-		// replicate breakdown enters as a single cluster of its pooled Samples, so a mixed-R pair is judged
-		// the same honest way. MW/KS above stay as descriptive columns only. At R=1 on BOTH sides this is
-		// skipped and Mann-Whitney on the pooled Samples decides the rank, as before.
+		// EXACT cluster-level rank permutation `clusterSeparation` — Mann-Whitney U on the per-sandbox
+		// medians, whole sandboxes the exchangeable unit. That is cluster-honest where MW on samples pooled
+		// across replicates is anti-conservative, and it carries the real 2/C(2R,R) floor, so small R reads
+		// as UNDERPOWERED rather than a false tie or a false separation. A row with no replicate breakdown
+		// enters as a single cluster of its pooled Samples, so a mixed-R pair is judged the same honest way.
+		// MW/KS above stay as descriptive columns only. At R=1 on BOTH sides this is skipped and
+		// Mann-Whitney on the pooled Samples decides the rank, as before.
+		//
+		// The verdict only, not the whole `bootstrapMedianDifferenceInterval`: the table renders no
+		// difference interval, and the seeded 10 000-resample hierarchical bootstrap behind `lo`/`hi` was
+		// the single largest cost of building this board — computed once per adjacent pair and discarded.
+		// `clusterSeparation` is the identical (RNG-free) verdict that function returns.
 		if (previous.replicates || candidate.replicates) {
-			const diff = bootstrapMedianDifferenceInterval(
-				previous.replicates ?? [previous.samples],
-				candidate.replicates ?? [candidate.samples],
-				{
-					seed: `${run.runId}:${metric.id}:${previous.row.providerId}:${candidate.row.providerId}`,
-				},
-			);
+			const clustersA = previous.replicates ?? [previous.samples];
+			const clustersB = candidate.replicates ?? [candidate.samples];
+			const cluster = clusterSeparation(clustersA, clustersB);
+			// Record the DECIDING test beside the descriptive one, so the renderer never has to guess which
+			// floor produced the verdict it is explaining.
+			if (candidate.row.pVsPrevious) {
+				candidate.row.pVsPrevious.cluster = {
+					p: cluster.pValue,
+					floor: cluster.minAttainablePValue,
+					sandboxesA: clustersA.length,
+					sandboxesB: clustersB.length,
+				};
+			}
 			// The same "a test that can never reach α is not evidence of sameness" rule as the R=1 path:
 			// when the between-sandbox floor already meets α (2/C(6,3)=0.1 at R=3), no data could separate
 			// the pair, so it is underpowered — never a "tied" verdict, which would claim the test had the
 			// power to find a difference and didn't. Rank on the value; the renderer discloses it.
-			if (diff.minAttainablePValue >= DEFAULT_ALPHA) {
+			if (cluster.minAttainablePValue >= DEFAULT_ALPHA) {
 				candidate.row.verdict = "underpowered";
 				settle(identical ? "identical-value" : null);
 				return;
 			}
-			candidate.row.verdict = diff.separated ? "separated" : "tied";
-			settle(diff.separated ? null : "statistical");
+			candidate.row.verdict = cluster.separated ? "separated" : "tied";
+			settle(cluster.separated ? null : "statistical");
 			return;
 		}
 
@@ -611,6 +710,7 @@ export function buildLeaderboard(run: Run): Leaderboard {
 
 	return {
 		runId: run.runId,
+		...(run.experiment?.cohortDigest ? { comparisonCohort: run.experiment.cohortDigest } : {}),
 		sha: run.sha,
 		generatedAt: run.generatedAt,
 		targetSpec: run.targetSpec,
@@ -636,12 +736,15 @@ export function buildLeaderboard(run: Run): Leaderboard {
 }
 
 /**
- * Describe every underpowered comparison the board actually contains, as `"3 v 3 floors at p ≈ 0.1"` —
- * quoting the floor THE TEST REPORTED for that row, not one recomputed from the sample sizes here. The
- * floor depends on the tie pattern as well as the sizes, so a footer that re-derived it from `n` alone
- * could print a number the row's own test never produced. An underpowered row is always compared against
- * the row above it, which is what supplies the other n. Deduplicated (several dimensions usually share
- * one shape) and ordered so the committed markdown stays byte-stable.
+ * Describe every underpowered comparison the board actually contains, as
+ * `"3 v 3 sandboxes floors at p ≈ 0.1"` — quoting the floor THE TEST REPORTED for that row, never one
+ * recomputed from the counts here. The floor depends on the TIE PATTERN as well as the counts, so a
+ * footer that re-derived it, or that deduplicated on the counts alone, could print a number the row's
+ * own test never produced: the committed run contains 3-v-3 comparisons floored at 0.1, 0.2, 0.4 AND
+ * 1.0, the last three from ties among the per-sandbox medians. Deduplication therefore keys on the
+ * (counts, floor) pair, so every distinct floor the board contains is listed. An underpowered row is
+ * always compared against the row above it, which is what supplies the other count. Ordered so the
+ * committed markdown stays byte-stable.
  */
 function underpoweredFloors(board: Leaderboard): string[] {
 	const seen = new Map<string, string>();
@@ -650,8 +753,23 @@ function underpoweredFloors(board: Leaderboard): string[] {
 			rows.forEach((row, i) => {
 				const previous = rows[i - 1];
 				if (row.verdict !== "underpowered" || !previous || !row.pVsPrevious) return;
-				const key = `${previous.n} v ${row.n}`;
-				seen.set(key, `${key} floors at p ≈ ${formatPValue(row.pVsPrevious.floor)}`);
+				// Quote the test that DECIDED, in ITS unit. When the sandbox-level test decided, the binding
+				// constraint is the number of machines and the floor is 2/C(Ra+Rb, Ra) — keying this on the
+				// pooled trial counts and printing the pooled floor is what made the published footnote assert
+				// "the floor exceeds α" beside a printed <0.001. Only the R=1-both-sides path falls through to
+				// the pooled Mann-Whitney, where trial counts genuinely are the unit.
+				//
+				// Key on the unit counts AND the floor, never the counts alone: the attainable floor depends on
+				// the TIE PATTERN among the per-sandbox medians as well as their number (see
+				// `minAttainablePValue`), so one shape yields several floors. The committed run has 3-v-3
+				// comparisons floored at 0.1, 0.2, 0.4 and 1.0 — a count-only key silently kept whichever
+				// landed last and printed it as if it were the floor for all of them.
+				const { cluster, floor } = row.pVsPrevious;
+				const unit = cluster
+					? `${cluster.sandboxesA} v ${cluster.sandboxesB} sandboxes`
+					: `${previous.n} v ${row.n} trials`;
+				const attainable = cluster ? cluster.floor : floor;
+				seen.set(`${unit}\0${attainable}`, `${unit} floors at p ≈ ${formatPValue(attainable)}`);
 			});
 		}
 	}
@@ -742,6 +860,62 @@ function syntheticSummary(metrics: readonly LeaderboardMetric[]): string {
 	return headline ? `${count} · headline: ${escapeHtml(headline.metric.label)}` : count;
 }
 
+/**
+ * The `<summary>` line over the figure dimension's collapsed tables. It says the tables are the
+ * per-task receipts for the charts above — a triangle labelled only "details" would read as
+ * something optional, and these are the only auditable numbers in the section.
+ */
+function figureTableSummary(metrics: readonly LeaderboardMetric[]): string {
+	const noun = metrics.length === 1 ? "task" : "tasks";
+	return `<strong>Per-task rankings</strong> · ${metrics.length} ${noun}, with medians, intervals and trial counts`;
+}
+
+/**
+ * The charts, one per suite, above the collapsed tables.
+ *
+ * Written as `<img src width alt>` rather than bare `![…](…)`: the charts are rasterised at 2×
+ * for hi-DPI displays, and the `width` attribute — which GitHub's Markdown renderer preserves —
+ * is what shows them at logical size. The alt text is not decoration — it is what a reader with
+ * the image unavailable gets INSTEAD of the section, so it names the suite, the size of the
+ * comparison and the disclosure count.
+ */
+function figureSection(figures: readonly LeaderboardFigure[]): string[] {
+	if (figures.length === 0) return [];
+	// How many charts there are is a property of the RUN (the ingest drops uncharted suites, and
+	// a new suite lands upstream without touching this file), so the prose must never hand-count
+	// them — "the three charts" was wrong the day a suite dropped to one completing environment.
+	const scaleClaim =
+		figures.length === 1
+			? "" //  one chart still uses the shared scale, but there is no cross-chart claim to state.
+			: " The charts share one time scale, so a second is the same length in all of them.";
+	const lines: string[] = [
+		"What a developer or a CI job actually waits on: each bar is one environment's whole pipeline",
+		`for that repo, segmented by task in execution order.${scaleClaim}`,
+		"",
+	];
+	for (const figure of figures) {
+		const environments = `${figure.charted} environment${figure.charted === 1 ? "" : "s"}`;
+		const disclosed =
+			figure.incomplete === 0 ? "" : `, ${figure.incomplete} disclosed as incomplete`;
+		const alt = escapeAttribute(
+			`${figure.suiteName}: ${figure.tasks} pipeline tasks across ${environments}${disclosed}, ` +
+				`stacked by task and sorted fastest-first`,
+		);
+		lines.push(
+			`<img src="${escapeAttribute(figure.file)}" width="${figure.width}" alt="${alt}">`,
+			"",
+		);
+	}
+	return lines;
+}
+
+/** HTML attribute escaping for the `<img>` tags above: `Bun.escapeHTML` covers the full set
+ *  (`& < > " '`), so an attribute cannot break out of its quotes no matter what a future
+ *  suite is named. (The sibling `escapeHtml` above stays hand-rolled on purpose — it escapes
+ *  MARKDOWN CELL TEXT, where quotes are inert and the committed artifact already carries them
+ *  raw; swapping it would churn LEADERBOARD.md bytes for no safety gain.) */
+const escapeAttribute = Bun.escapeHTML;
+
 /** Format a metric value compactly: integers as-is, otherwise up to 4 significant digits, trimmed. */
 function formatValue(value: number): string {
 	if (Number.isInteger(value)) return String(value);
@@ -762,17 +936,26 @@ function rowNote(r: LeaderboardRow): string {
 		return equalValues ? "equal values" : "";
 	}
 	if (r.verdict === "underpowered") {
-		return equalValues ? "n too small, equal medians" : "n too small";
+		// "too few sandboxes", not "n too small": at R=3 the row can print n=70 trials and still be
+		// undecidable, because the exchangeable unit is the machine. Naming `n` pointed at the one number
+		// on the row that was not the constraint.
+		const cause = r.pVsPrevious?.cluster ? "too few sandboxes" : "n too small";
+		return equalValues ? `${cause}, equal medians` : cause;
 	}
 	if (r.verdict === "tied") return "tied";
 	return "";
 }
 
-/** Mann-Whitney cell in the pairwise details table — reuses {@link rowNote} for the verdict suffix. */
+/**
+ * `p vs. above` cell — the p-value of the test that DECIDED this row's verdict, not the descriptive one.
+ * Where replicate sandboxes exist that is the sandbox-level cluster test; the pooled Mann-Whitney is
+ * shown only where a single sandbox per side left nothing else to test on. Printing the pooled p here
+ * was how the table came to advertise `<0.001` beside a note saying the comparison was undecidable.
+ */
 function formatPairwiseP(r: LeaderboardRow): string {
 	const note = rowNote(r);
 	if (r.pVsPrevious === null) return note ? `— (${note})` : "—";
-	const p = formatPValue(r.pVsPrevious.mannWhitney);
+	const p = formatPValue(r.pVsPrevious.cluster?.p ?? r.pVsPrevious.mannWhitney);
 	return note ? `${p} (${note})` : p;
 }
 
@@ -880,8 +1063,30 @@ function rosterSection(roster: readonly ProviderRosterEntry[]): string[] {
 	return lines;
 }
 
-/** Render a {@link Leaderboard} as a Markdown document — the committed comparison surface. */
-export function renderLeaderboardMarkdown(board: Leaderboard): string {
+/**
+ * Render a {@link Leaderboard} as a Markdown document — the committed comparison surface.
+ *
+ * `figures` are the suite charts the caller has already rendered (see {@link LeaderboardFigure} on
+ * why they are passed rather than derived). The `realworld` section leads with them and then
+ * COLLAPSES its per-task tables behind a disclosure, which is a deliberate half-measure and worth
+ * saying why:
+ *
+ *  - The three charts are what a reader actually wants from that section. Seventeen ranked tables —
+ *    one per (repo, task) — is a way of having the information without conveying it: nothing on the
+ *    page told you that a pipeline on the slowest environment costs 3.4× what it costs on the
+ *    fastest, because that number was never in any of the tables.
+ *  - Deleting the tables would take the numbers off the page entirely, and every number this
+ *    document prints is auditable back to the Run it came from. A picture of a bar is not: the SVG
+ *    is glyph outlines, so the figures are exactly the one part of this file a reader cannot check.
+ *    The tables are the receipts for the charts, and they stay one click away for that reason.
+ *
+ * The mechanism is the same `<details>` the synthetic dimensions already use, so the document has
+ * one collapse idiom rather than two.
+ */
+export function renderLeaderboardMarkdown(
+	board: Leaderboard,
+	figures: readonly LeaderboardFigure[],
+): string {
 	// Render the board's OWN target, not the global constant, so the header can never claim the pinned
 	// spec while the comparability warnings below report another one.
 	const spec = formatSpec(board.targetSpec);
@@ -896,6 +1101,16 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 	const providerCount = new Set(rows.map((row) => row.providerId)).size;
 	const metricNoun = metricCount === 1 ? "metric" : "metrics";
 	const providerNoun = providerCount === 1 ? "provider" : "providers";
+	// Only claim a disclosure triangle when the document will actually render one — a synthetic
+	// dimension, or the figure dimension with charts to fold its tables under. A board with
+	// neither renders every table in the open, and a header that sent the reader hunting for a
+	// triangle that does not exist would be wrong on its very first claim.
+	const anyCollapsed = board.dimensions.some(
+		(dimension) =>
+			SYNTHETIC_DIMENSIONS.has(dimension.dimension as never) ||
+			(dimension.dimension === FIGURE_DIMENSION && figures.length > 0),
+	);
+	const collapseNote = anyCollapsed ? " — some behind a disclosure triangle, none omitted" : "";
 	// Header provenance: every identifier links to the thing it names, so a reader can audit any number
 	// on this page without being told where to look — the workflow run that produced it, the commit it
 	// was measured against, and the committed Run document it was rendered from.
@@ -904,15 +1119,22 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 		"",
 		`Run ${runSourceLinks(board.runId)} · commit ${commitSourceLink(board.sha)} ·`,
 		`dataset ${datasetSourceLink(board.runId)} · generated ${board.generatedAt}`,
+		...(board.comparisonCohort
+			? [
+					"",
+					`Comparison cohort: \`${board.comparisonCohort}\`. Compare scores only with the same workload and eligible metric cohort.`,
+				]
+			: []),
 		"",
 		`Requested target for every provider: **${spec}**. This run contains **${rows.length} metric records**`,
 		`backed by **${observationCount} retained trial observations**, across **${metricCount} ${metricNoun}** and`,
 		`**${providerCount} ${providerNoun}**; every emitted, catalogued metric has a ranked table below`,
-		"(median of retained trials), grouped by dimension with its headline first.",
+		`(median across sandboxes), grouped by dimension with its headline first${collapseNote}.`,
 		"Generated from the published Run dataset — do not edit by hand. Methodology:",
 		"[`docs/methodology.md`](docs/methodology.md).",
 		"",
-		"**How to read:** value = median (p50) · 95% CI = bootstrap around that median · rows share a rank only",
+		"**How to read:** value = median across sandboxes (one machine, one vote) · interval = cluster bootstrap,",
+		"labelled 95% but ≈77% actual coverage at 3 sandboxes (see methodology) · rows share a rank only",
 		"when statistically indistinguishable or tied on the median (see details below) · a coverage gap means unmeasured, never a score of zero.",
 		"CPU/RAM comparability uses observed vCPU and RAM (±10% RAM); disk is a workload-capacity gate",
 		"surfaced through coverage gaps, not part of the compute-match verdict.",
@@ -931,6 +1153,15 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 			`actually waits on is what this benchmark exists to measure. The synthetic microbenchmarks (${names})`,
 			"load one hardware axis in isolation — a real question, but a different one — so each is collapsed by",
 			"default; expand a section to read its tables.",
+			"",
+		);
+	}
+	if (figures.length > 0) {
+		lines.push(
+			`**The \`${FIGURE_DIMENSION}\` section is drawn, not tabulated.** One stacked chart per repo, each bar a`,
+			"whole pipeline on one environment and each segment a task. Its per-task rankings — the medians,",
+			"intervals and trial counts every bar is built from — are still here, one triangle down: the charts",
+			"are what the section is FOR, and the tables are how you check them.",
 			"",
 		);
 	}
@@ -958,12 +1189,22 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 
 	for (const { dimension, metrics } of board.dimensions) {
 		lines.push(`## ${dimension}`, "");
+		// The figure dimension puts its charts ABOVE the collapse, so the section reads as three
+		// pictures with the receipts folded underneath.
+		if (dimension === FIGURE_DIMENSION) lines.push(...figureSection(figures));
 		// A synthetic dimension collapses its TABLES, never its heading: the heading stays in the rendered
 		// document outline so the board still discloses which hardware axes were measured — collapsing it
 		// too would make a measured dimension indistinguishable from one that never ran.
-		const collapsed = SYNTHETIC_DIMENSIONS.has(dimension);
+		//
+		// The figure dimension collapses for a different reason — its charts replace the tables as the
+		// thing you read — but only when there ARE charts. With none, its tables render in the open:
+		// hiding them behind a triangle whose figures do not exist would take the numbers off the page.
+		const collapsed =
+			SYNTHETIC_DIMENSIONS.has(dimension) || (dimension === FIGURE_DIMENSION && figures.length > 0);
 		if (collapsed) {
-			lines.push("<details>", `<summary>${syntheticSummary(metrics)}</summary>`, "");
+			const summary =
+				dimension === FIGURE_DIMENSION ? figureTableSummary(metrics) : syntheticSummary(metrics);
+			lines.push("<details>", `<summary>${summary}</summary>`, "");
 		}
 		for (const { metric, rows: metricRows } of metrics) {
 			const better = metric.direction === "HIB" ? "higher is better" : "lower is better";
@@ -977,14 +1218,16 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 				"",
 				`_${metricTakeaway(dimension, metric, metricRows)}_`,
 				"",
+				// Sandboxes BEFORE trials, and both labelled. The unit of replication is the machine, and a
+				// single `n` column silently mixed the two: n=12 meant twelve machines, n=70 meant three.
 				hasNotes
-					? `| Rank | Provider | ${metric.label} (${metric.unit}) | 95% bootstrap interval | n | Note |`
-					: `| Rank | Provider | ${metric.label} (${metric.unit}) | 95% bootstrap interval | n |`,
+					? `| Rank | Provider | ${metric.label} (${metric.unit}) | 95% bootstrap interval | Sandboxes | Trials | Note |`
+					: `| Rank | Provider | ${metric.label} (${metric.unit}) | 95% bootstrap interval | Sandboxes | Trials |`,
 				hasNotes
-					? "| ---: | --- | ---: | ---: | ---: | --- |"
-					: "| ---: | --- | ---: | ---: | ---: |",
+					? "| ---: | --- | ---: | ---: | ---: | ---: | --- |"
+					: "| ---: | --- | ---: | ---: | ---: | ---: |",
 				...metricRows.map((row, i) => {
-					const base = `| ${row.rank} | ${row.displayName} | ${formatValue(row.value)} | ${formatInterval(row)} | ${row.n} |`;
+					const base = `| ${row.rank} | ${row.displayName} | ${formatValue(row.value)} | ${formatInterval(row)} | ${row.sandboxes ?? 1} | ${row.n} |`;
 					return hasNotes ? `${base} ${notes[i] || "—"} |` : base;
 				}),
 				"",
@@ -1048,16 +1291,29 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 		"<details>",
 		"<summary>How rankings are decided</summary>",
 		"",
-		"The value is the median (p50) of the retained per-trial Samples, not the mean — a single stalled",
-		"pass drags a mean far more than it moves a median. The 95% interval is a percentile bootstrap of",
-		"that median (10,000 resamples, seeded from the Run id so the table is reproducible byte-for-byte).",
-		"It is a descriptive interval conditional on the retained trials, **not a calibrated frequentist",
-		"confidence interval**: n is small and within-sandbox trials may be dependent on host scheduling.",
+		"The value is the median of the PER-SANDBOX medians — one machine, one vote — not the median of all",
+		"trials pooled together. Pooling would weight each machine by how many trials it ran, and the harness",
+		"chooses that count adaptively by watching the variance, so the noisiest machine would carry the most",
+		"weight in the published number. The median, not the mean, because a single stalled pass drags a mean",
+		"far more than it moves a median.",
+		"",
+		"The interval is a cluster bootstrap of that same statistic (10,000 resamples, seeded from the Run id",
+		"so the table is reproducible byte-for-byte): whole sandboxes are resampled with replacement, keeping",
+		"each machine's trials intact.",
+		"",
+		"**The interval is labelled 95%, and at these sandbox counts it does not achieve 95%.** Coverage is a",
+		"property of how many machines were measured, not of the estimator: simulated at ≈77% for 3 sandboxes,",
+		"≈92% at 6, and ≈95% at 20. No percentile bootstrap reaches nominal coverage at 3 clusters. Read a",
+		"3-sandbox interval as a resampling envelope over three machines, **not** as a calibrated frequentist",
+		"confidence interval. Within-sandbox trials may also be dependent on host scheduling.",
 		"",
 		`Rows are separated only when Mann-Whitney U (two-sided, α = ${DEFAULT_ALPHA}, enumerated exactly`,
 		"over the permutation null rather than approximated) finds evidence of stochastic ordering — at these",
-		"sample sizes the normal approximation can report a p the exact test cannot actually produce. KS is",
-		"reported separately for distribution *shape* and does not drive the ranking.",
+		"sample sizes the normal approximation can report a p the exact test cannot actually produce. Where",
+		"replicate sandboxes exist that test runs on the PER-SANDBOX MEDIANS, so whole machines are the",
+		"exchangeable unit; testing pooled trials instead would treat repeated measurements of one machine as",
+		"independent evidence about the provider. KS is reported separately for distribution *shape* and does",
+		"not drive the ranking.",
 		"",
 	);
 
@@ -1084,12 +1340,15 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 	}
 
 	lines.push(
-		"Samples are repeated trials inside one sandbox, so their spread is environmental (neighbours, host",
-		"contention, virtualization), and a wide bootstrap interval or a large `n` (the harness re-runs a test that will not",
-		"converge) is itself the signal that the provider's performance is unstable, not that the measurement",
-		"is imprecise.",
+		"Each metric is measured on several independent sandboxes (the **Sandboxes** column), and within each",
+		"sandbox the benchmark runs several trials (**Trials**). Trials capture within-machine noise —",
+		"neighbours, host contention, virtualization; sandboxes capture the machine-to-machine variation a",
+		"user actually experiences when they start a new environment. The ranking and its interval both treat",
+		"the SANDBOX as the unit, so more trials on the same machine never make a row look better-evidenced.",
+		"Under adaptive trial counts a large **Trials** figure is in fact a sign the machines were unstable",
+		"(the harness kept re-running), not that the estimate is precise.",
 		"",
-		"At the small `n` this suite produces, a non-significant result means *not enough evidence to",
+		"At the sandbox counts this suite produces, a non-significant result means *not enough evidence to",
 		"separate*, never *the providers are equal*.",
 		"",
 	);
@@ -1097,8 +1356,14 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 	const floors = underpoweredFloors(board);
 	if (floors.length > 0) {
 		lines.push(
-			"`n too small` is the extreme of that: Mann-Whitney's best attainable p already exceeds α for those",
-			`Samples, so the test could not have separated the rows at any effect size (here ${floors.join("; ")}).`,
+			"`too few sandboxes` is the extreme of that: the deciding test's best attainable p already exceeds α,",
+			"so it could not have separated the rows at any effect size, however far apart their values are.",
+			`The floor is a property of the design — here ${floors.join("; ")}.`,
+			"At three sandboxes a side the floor is 2/C(6,3) = 0.1, which is above α, so **no** three-sandbox",
+			"comparison in this table can ever be declared separated. That is a fact about the replicate count,",
+			"not about the providers. One shape can appear more than once above with different floors: ties",
+			"among a provider's per-sandbox medians raise the floor further (to 1.0 when every median in the",
+			"comparison is equal), so the count alone does not determine it.",
 			"Such rows are ranked on their observed medians and are **not** claimed to be tied — read the gap",
 			"between the values, and treat the p-value as unable to settle them either way. Where such a row",
 			"nevertheless shares the rank above it, the note reads `equal medians`: the two values are simply",
@@ -1113,7 +1378,11 @@ export function renderLeaderboardMarkdown(board: Leaderboard): string {
 		lines.push(
 			"### Pairwise tests (vs. row above)",
 			"",
-			"`p vs. above` is Mann-Whitney (drives rank). `p (KS)` is Kolmogorov-Smirnov on distribution",
+			"`p vs. above` is the SANDBOX-LEVEL test that decides the rank wherever replicate sandboxes exist —",
+			"Mann-Whitney U on each provider's per-sandbox medians, whole machines as the exchangeable unit.",
+			"(Only where a provider ran in a single sandbox does it fall back to Mann-Whitney on pooled trials,",
+			"which treats repeated measurements of one machine as independent and is anti-conservative.)",
+			"`p (KS)` is Kolmogorov-Smirnov on distribution",
 			"*shape* — it does not drive the ranking. A tied Mann-Whitney beside a small KS often means the",
 			"same typical speed with different behaviour (e.g. bimodal stalls).",
 			"These are unadjusted, exploratory per-comparison p-values; no family-wise or false-discovery-rate",

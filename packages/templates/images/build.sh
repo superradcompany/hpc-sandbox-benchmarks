@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the toolchain base image and all provider variants. The pins come from the arktype-validated
+# Build the toolchain base image and its provider variants. The pins come from the arktype-validated
 # TypeScript source of truth (packages/templates/src/pins.ts) — there is no versions.env. This script
 # validates that config (via bun), passes the image/PTS pins to `docker build` as --build-args, and
 # generates the mise.toml (tool versions) + e2b.toml from the same source. Single source of build
@@ -14,6 +14,15 @@ PINS_TS="${HERE}/../src/pins.ts"
 
 REGISTRY="${REGISTRY:-ghcr.io}"
 IMAGE_OWNER="${IMAGE_OWNER:-starslingdev}"
+
+# > Every provider variant this script builds, DERIVED from the directories beside it rather than
+# > hand-listed: a variant is exactly an `images/<name>/Dockerfile` that isn't the base. Adding one is
+# > then a directory, not a directory plus a literal someone has to remember to update.
+variants=()
+for dockerfile in "${HERE}"/*/Dockerfile; do
+	variant_name="$(basename "$(dirname "${dockerfile}")")"
+	[ "${variant_name}" = "base" ] || variants+=("${variant_name}")
+done
 
 # > Validate the pins and collect them as KEY=VALUE lines. `bun` exits non-zero (and set -e aborts)
 # > if arktype rejects any pin, so a bad/unfilled pin fails the build before docker is even invoked.
@@ -54,15 +63,21 @@ bun "${PINS_TS}" --mise-toml > "${HERE}/base/mise.toml"
 bun "${PINS_TS}" --e2b-toml > "${HERE}/e2b/e2b.toml"
 bun "${HERE}/../src/manifest.ts" > "${HERE}/base/toolchain-manifest.json"
 
+# Authenticate downloads without storing the token in an image layer.
+secret_args=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+	secret_args+=(--secret "id=github_token,env=GITHUB_TOKEN")
+fi
+
 echo ">>> building base: ${base_dev_tag} (+ ${base_ref})"
-docker build "${base_build_args[@]}" "${meta_args[@]}" \
+docker build "${base_build_args[@]}" "${meta_args[@]}" "${secret_args[@]}" \
 	-t "${base_dev_tag}" -t "${base_ref}" \
 	"${HERE}/base"
 
-# > Each variant composes on the just-built base via --build-arg BASE_IMAGE, with the images/
-# > directory as context so it can COPY the shared _shared/validate-base.sh. Variants take only the
-# > base ref + build metadata (their Dockerfiles declare no toolchain pins).
-for provider in e2b daytona modal; do
+# > Each variant composes on the just-built base via --build-arg BASE_IMAGE, with the images/ directory
+# > as context so it can COPY the shared _shared/validate-base.sh. Variants take only the base ref +
+# > build metadata (their Dockerfiles declare no toolchain pins).
+for provider in "${variants[@]}"; do
 	ref="${base_repo}-${provider}:${image_version}"
 	echo ">>> building ${provider} variant: ${ref}"
 	docker build "${meta_args[@]}" \

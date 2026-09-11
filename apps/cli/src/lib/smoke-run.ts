@@ -2,10 +2,13 @@
 // body that both `bench-smoke` (boot the published image) and `bake` (boot the just-baked candidate)
 // feed to {@link forEachProviderWithCreds}. The probe results are captured INSIDE the lifecycle so a
 // teardown-only failure still reports which probes passed instead of looking like nothing ran.
-import { withSandbox } from "@sandbox-benchmarks/harness";
-import type { ProviderConfig } from "@sandbox-benchmarks/providers";
+import { withSandbox, withSandboxWork } from "@sandbox-benchmarks/harness";
+import { TARGET_SPEC } from "@sandbox-benchmarks/schema";
 import type { SmokeResult } from "@sandbox-benchmarks/templates/smoke";
 import { runSmoke } from "@sandbox-benchmarks/templates/smoke";
+import type { ArtifactResolution } from "./driver-run.ts";
+import { openDriver, usesSessionOperations, withDriverSandbox } from "./driver-run.ts";
+import type { ProviderTarget } from "./providers-run.ts";
 
 /** A smoke run's outcome: the probe results, plus the lifecycle error if boot/teardown threw. */
 export interface SmokeOutcome {
@@ -15,17 +18,74 @@ export interface SmokeOutcome {
 }
 
 /**
- * Boot a sandbox from `config`, run the smoke spec, and tear it down. Never throws: `checks` are
+ * Boot a sandbox from `target`, run the smoke spec, and tear it down. Never throws: `checks` are
  * captured before teardown so they survive a destroy failure, and any lifecycle error is returned in
  * `error` rather than thrown — the caller (via {@link smokeOk}) decides pass/fail.
+ *
+ * Registered ids create through {@link withDriverSandbox}; waived ids through leftover adapters.
+ *
+ * `options.artifact` is the driver lane's artifact override (bake validates a candidate ref this
+ * way). The leftover lane has no equivalent channel — its ref rides the `ProviderConfig` the caller
+ * already built — so passing one with a `legacy` target is rejected rather than ignored: silently
+ * booting the published artifact would report a candidate as validated without ever touching it.
  */
-export async function bootAndSmoke(config: ProviderConfig): Promise<SmokeOutcome> {
+export async function bootAndSmoke(
+	target: ProviderTarget,
+	options: { readonly artifact?: ArtifactResolution } = {},
+): Promise<SmokeOutcome> {
 	let checks: SmokeResult[] = [];
 	try {
-		await withSandbox(config, async (sandbox) => {
-			checks = await runSmoke((cmd) => sandbox.runCommand(cmd));
-		});
-		return { checks };
+		if (target.kind === "legacy" && options.artifact !== undefined) {
+			throw new Error(
+				`bootAndSmoke(${target.id}): the leftover adapter lane takes its artifact through the provider config, not options.artifact`,
+			);
+		}
+		switch (target.kind) {
+			case "driver":
+				if (usesSessionOperations(target.id)) {
+					const opened = await openDriver(target.id, options);
+					await withSandboxWork(
+						{
+							module: opened.module,
+							driver: opened.driver,
+							request: { spec: TARGET_SPEC, artifact: opened.artifact },
+						},
+						async ({ session }) => {
+							checks = await runSmoke(async (command) => {
+								const result = await session.exec(command);
+								if (result.exit.kind !== "exited")
+									throw new Error(`Smoke command returned ${JSON.stringify(result.exit)}`);
+								return { stdout: result.stdout, stderr: result.stderr, exitCode: result.exit.code };
+							});
+						},
+					);
+					return { checks };
+				}
+				await withDriverSandbox(
+					target.id,
+					async (sandbox) => {
+						checks = await runSmoke(async (cmd) => {
+							const result = await sandbox.runCommand(cmd);
+							return {
+								stdout: result.stdout ?? "",
+								stderr: result.stderr ?? "",
+								exitCode: result.exitCode,
+							};
+						});
+					},
+					options,
+				);
+				return { checks };
+			case "legacy":
+				await withSandbox(target.config, async (sandbox) => {
+					checks = await runSmoke((cmd) => sandbox.runCommand(cmd));
+				});
+				return { checks };
+			default: {
+				const _never: never = target;
+				return _never;
+			}
+		}
 	} catch (error) {
 		return { checks, error };
 	}

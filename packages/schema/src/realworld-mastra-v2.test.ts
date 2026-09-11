@@ -25,8 +25,18 @@ test("Mastra v2 preserves the compatibility boundary and historical catalog", ()
 	expect(revised.TASK_CMD_test_core).not.toBe(original.TASK_CMD_test_core);
 	expect(revised.TASK_CMD_test_core).toContain("--max-old-space-size=4096");
 	expect(revised.TASK_CMD_test_core).toContain("--maxWorkers=1");
-	for (const metric of SUITES["realworld-mastra"].metrics) {
+	for (const metric of METRIC_CATALOG.filter((entry) =>
+		entry.id.startsWith("realworld_mastra_v2_"),
+	).map((entry) => entry.id)) {
 		expect(metric).toStartWith("realworld_mastra_v2_");
 		expect(METRIC_CATALOG.some((entry) => entry.id === metric.replace("_v2_", "_"))).toBe(true);
 	}
+});
+
+// The scored suite follows the fixed upstream pnpm entrypoint; old V2 metrics remain readable.
+test("scored Mastra uses upstream's fixed core-test entrypoint", () => {
+	expect(SUITES["realworld-mastra"].commands).toEqual(["mise run benchmark:realworld:pts:mastra"]);
+	expect(target("realworld-mastra").TASK_CMD_test_core).toContain(
+		"NODE_OPTIONS=--max-old-space-size=4096 VITEST_MAX_WORKERS=1 pnpm test:core",
+	);
 });

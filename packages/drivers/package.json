@@ -1,0 +1,35 @@
+{
+  "name": "@sandbox-benchmarks/drivers",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Generated lazy loader for independently packaged provider integrations.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sandbox-benchmarks/blaxel": "workspace:*",
+    "@sandbox-benchmarks/daytona": "workspace:*",
+    "@sandbox-benchmarks/driver": "workspace:*",
+    "@sandbox-benchmarks/e2b": "workspace:*",
+    "@sandbox-benchmarks/microsandbox-cloud": "workspace:*",
+    "@sandbox-benchmarks/modal": "workspace:*",
+    "@sandbox-benchmarks/namespace": "workspace:*",
+    "@sandbox-benchmarks/novita": "workspace:*",
+    "@sandbox-benchmarks/runcloud": "workspace:*",
+    "@sandbox-benchmarks/runloop": "workspace:*",
+    "@sandbox-benchmarks/tama": "workspace:*",
+    "@sandbox-benchmarks/vercel": "workspace:*"
+  },
+  "devDependencies": {
+    "@repo/tsconfig": "workspace:*",
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

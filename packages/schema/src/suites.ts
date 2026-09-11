@@ -1,3 +1,4 @@
+import { type } from "arktype";
 import type { Dimension } from "./metrics.ts";
 
 /**
@@ -261,13 +262,13 @@ export const SUITES = {
 		defaultReplicas: 12,
 		dimensions: ["realworld"],
 		metrics: [
-			"realworld_mastra_v2_task_git_clone",
-			"realworld_mastra_v2_task_cold_install",
-			"realworld_mastra_v2_task_lint_format",
-			"realworld_mastra_v2_task_build_core",
-			"realworld_mastra_v2_task_test_core",
+			"realworld_mastra_task_git_clone",
+			"realworld_mastra_task_cold_install",
+			"realworld_mastra_task_lint_format",
+			"realworld_mastra_task_build_core",
+			"realworld_mastra_task_test_core",
 		],
-		commands: ["mise run benchmark:realworld:pts:mastra-v2"],
+		commands: ["mise run benchmark:realworld:pts:mastra"],
 	},
 	// At k=1 each task case runs once (including the per-run git-clean/install resets); the command
 	// budget covers slower virtualized filesystems while the sandbox lifetime leaves setup and
@@ -324,6 +325,9 @@ export type SuiteName = keyof typeof SUITES;
 
 /** The known suite names. */
 export const SUITE_NAMES = Object.keys(SUITES) as SuiteName[];
+
+/** Runtime form of the canonical suite-name vocabulary. */
+export const suiteNameSchema = type.enumerated(...SUITE_NAMES);
 
 /**
  * Host-side checkout/teardown/normalization/upload allowance beyond the sandbox lifetime — what a

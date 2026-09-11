@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parseRun, parseRunIndex } from "./index.ts";
+import { parseRun, parseRunIndex, runDocumentPath, runDocumentPaths } from "./index.ts";
 
 const validRun = {
 	schemaVersion: "2",
@@ -9,7 +9,7 @@ const validRun = {
 	targetSpec: { vcpus: 2, memoryGb: 8, diskGb: 20 },
 	providers: [
 		{
-			providerId: "daytona",
+			providerId: "daytona-vm",
 			validationStatus: "validated",
 			observedSpecs: { vcpus: 2, memoryGb: 8 },
 			metrics: [
@@ -42,10 +42,203 @@ describe("Run schema", () => {
 		expect(run.providers[0]?.validationStatus).toBe("validated");
 	});
 
-	it("accepts every published schemaVersion from v2 through v4", () => {
+	it("accepts every published schemaVersion from v2 through v6", () => {
 		for (const schemaVersion of ["2", "3", "4"] as const) {
 			expect(parseRun({ ...validRun, schemaVersion }).schemaVersion).toBe(schemaVersion);
 		}
+		const v5 = structuredClone(validRun);
+		v5.schemaVersion = "5";
+		for (const provider of v5.providers) {
+			(provider as Record<string, unknown>).costEvidence = [];
+		}
+		expect(parseRun(v5).schemaVersion).toBe("5");
+
+		const v6 = structuredClone(v5);
+		v6.schemaVersion = "6";
+		for (const provider of v6.providers) {
+			(provider as Record<string, unknown>).artifactEvidence = [
+				{
+					cell: { runId: "run-1", providerId: "daytona-vm", suite: "cpu-node" },
+					sandboxId: "isandbox",
+					provenance: {
+						source: "request-fallback",
+						requested: { kind: "baked", ref: "toolchain-v8" },
+					},
+				},
+			];
+		}
+		expect(parseRun(v6).schemaVersion).toBe("6");
+	});
+
+	it("gates artifact evidence at v6 in both directions", () => {
+		const evidence = {
+			cell: { runId: "run-1", providerId: "daytona-vm", suite: "cpu-node" },
+			sandboxId: "isandbox",
+			provenance: {
+				source: "request-fallback",
+				requested: { kind: "baked", ref: "toolchain-v8" },
+			},
+		};
+
+		// Writing the field without bumping the version is rejected here, rather than reaching a
+		// v6-gated consumer that would read the attribution as if the producer had declared it.
+		const early = structuredClone(validRun);
+		for (const provider of early.providers) {
+			(provider as Record<string, unknown>).artifactEvidence = [evidence];
+		}
+		expect(() => parseRun(early)).toThrow(/v6 Run when a ProviderRun carries artifactEvidence/);
+
+		// And a v6 Run cannot omit the attribution that is the whole point of the version.
+		const missing = structuredClone(validRun);
+		missing.schemaVersion = "6";
+		for (const provider of missing.providers) {
+			(provider as Record<string, unknown>).costEvidence = [];
+		}
+		expect(() => parseRun(missing)).toThrow(/v6 ProviderRun with an artifactEvidence array/);
+
+		const valid = structuredClone(missing);
+		for (const provider of valid.providers) {
+			(provider as Record<string, unknown>).artifactEvidence = [evidence];
+		}
+		const parsed = parseRun(valid);
+		expect(parsed.providers[0]?.artifactEvidence?.[0]?.provenance.source).toBe("request-fallback");
+	});
+
+	it("will not let a measured v6 provider claim it never booted", () => {
+		// An empty array asserts "this provider booted nothing". A row carrying Metrics measured that
+		// inside a sandbox, so the two cannot both be true — and an unattributed measurement is the
+		// exact gap v6 exists to close.
+		const unattributed = structuredClone(validRun);
+		unattributed.schemaVersion = "6";
+		for (const provider of unattributed.providers) {
+			(provider as Record<string, unknown>).costEvidence = [];
+			(provider as Record<string, unknown>).artifactEvidence = [];
+		}
+		expect(() => parseRun(unattributed)).toThrow(/metrics carry artifact attribution/);
+
+		// A row that measured nothing may still legitimately carry an empty array.
+		const noMetrics = structuredClone(unattributed);
+		for (const provider of noMetrics.providers) {
+			(provider as Record<string, unknown>).metrics = [];
+			(provider as Record<string, unknown>).validationStatus = "pending";
+		}
+		expect(parseRun(noMetrics).schemaVersion).toBe("6");
+	});
+
+	it("rejects a persisted driver report that contradicts its request", () => {
+		// ADR-0007 makes a differing report a create-time contradiction that tears down the orphan, so
+		// a Run carrying the disagreement would mean that teardown never happened.
+		const contradiction = structuredClone(validRun);
+		contradiction.schemaVersion = "6";
+		for (const provider of contradiction.providers) {
+			(provider as Record<string, unknown>).costEvidence = [];
+			(provider as Record<string, unknown>).artifactEvidence = [
+				{
+					cell: { runId: "run-1", providerId: "daytona-vm", suite: "cpu-node" },
+					sandboxId: "isandbox",
+					provenance: {
+						source: "driver-reported",
+						requested: { kind: "baked", ref: "toolchain-v8" },
+						reported: { kind: "baked", ref: "toolchain-v7" },
+					},
+				},
+			];
+		}
+		expect(() => parseRun(contradiction)).toThrow(/ref matches the request/);
+	});
+
+	it("keeps artifact attribution joined to one unambiguous benchmark cell", () => {
+		const attributed = structuredClone(validRun);
+		attributed.schemaVersion = "6";
+		const provider = attributed.providers[0] as Record<string, unknown>;
+		provider.costEvidence = [];
+		provider.artifactEvidence = [
+			{
+				cell: { runId: "run-1", providerId: "daytona-vm", suite: "cpu-node" },
+				sandboxId: "sb-1",
+				provenance: {
+					source: "request-fallback",
+					requested: { kind: "baked", ref: "sandbox-benchmarks-toolchain-v8" },
+				},
+			},
+		];
+		expect(parseRun(attributed).schemaVersion).toBe("6");
+
+		const wrongParent = structuredClone(attributed);
+		const wrongEvidence = (
+			(wrongParent.providers[0] as Record<string, unknown>).artifactEvidence as Array<
+				Record<string, unknown>
+			>
+		)[0];
+		if (wrongEvidence)
+			wrongEvidence.cell = { runId: "other", providerId: "daytona-vm", suite: "cpu-node" };
+		expect(() => parseRun(wrongParent)).toThrow(/match its parent Run/);
+
+		const wrongShard = structuredClone(attributed);
+		(wrongShard as Record<string, unknown>).replicateIndex = 1;
+		expect(() => parseRun(wrongShard)).toThrow(/replicateIndex matches the Run/);
+
+		const duplicateCell = structuredClone(attributed);
+		const records = (duplicateCell.providers[0] as Record<string, unknown>)
+			.artifactEvidence as Array<Record<string, unknown>>;
+		records.push({ ...structuredClone(records[0]), sandboxId: "sb-2" });
+		expect(() => parseRun(duplicateCell)).toThrow(/at most one artifact attribution/);
+
+		const reusedSandbox = structuredClone(attributed);
+		const reusedRecords = (reusedSandbox.providers[0] as Record<string, unknown>)
+			.artifactEvidence as Array<Record<string, unknown>>;
+		reusedRecords.push({
+			...structuredClone(reusedRecords[0]),
+			cell: { runId: "run-1", providerId: "daytona-vm", suite: "system" },
+		});
+		expect(() => parseRun(reusedSandbox)).toThrow(/sandbox id used by exactly one benchmark cell/);
+
+		const sameArtifact = structuredClone(attributed);
+		const sameRecords = (sameArtifact.providers[0] as Record<string, unknown>)
+			.artifactEvidence as Array<Record<string, unknown>>;
+		sameRecords.push({
+			cell: { runId: "run-1", providerId: "daytona-vm", suite: "system" },
+			sandboxId: "sb-2",
+			provenance: {
+				source: "request-fallback",
+				// Deliberately reverse the JSON key order; identity is semantic, not byte-order-sensitive.
+				requested: { ref: "sandbox-benchmarks-toolchain-v8", kind: "baked" },
+			},
+		});
+		expect(parseRun(sameArtifact).providers[0]?.artifactEvidence).toHaveLength(2);
+
+		const mixedArtifact = structuredClone(sameArtifact);
+		const mixedRecords = (mixedArtifact.providers[0] as Record<string, unknown>)
+			.artifactEvidence as Array<Record<string, unknown>>;
+		const second = mixedRecords[1] as Record<string, unknown>;
+		second.provenance = {
+			source: "request-fallback",
+			requested: { kind: "baked", ref: "different-template" },
+		};
+		expect(() => parseRun(mixedArtifact)).toThrow(/one effective artifact across every sandbox/);
+	});
+
+	it("gates cost evidence at v5 and checks its parent cell identity", () => {
+		const evidence = {
+			kind: "missing",
+			cell: { runId: "run-1", providerId: "daytona-vm", suite: "cpu-node" },
+			subject: { kind: "sandbox", sandboxId: "sb-1" },
+			capturedAt: "2026-08-08T00:00:00.000Z",
+			sdk: { packageName: "sdk", version: "1.0.0" },
+			reason: "unsupported_public_api",
+			detail: "No public endpoint.",
+		};
+		const preV5 = structuredClone(validRun);
+		(preV5.providers[0] as Record<string, unknown>).costEvidence = [];
+		expect(() => parseRun(preV5)).toThrow(/v5 Run/);
+		expect(() => parseRun({ ...validRun, schemaVersion: "5" })).toThrow(/costEvidence array/);
+
+		const v5 = structuredClone(validRun);
+		v5.schemaVersion = "5";
+		(v5.providers[0] as Record<string, unknown>).costEvidence = [evidence];
+		expect(parseRun(v5).providers[0]?.costEvidence).toHaveLength(1);
+		evidence.cell.runId = "other-run";
+		expect(() => parseRun(v5)).toThrow(/match its parent Run/);
 	});
 
 	it("rejects a v2 Run that carries a v3-only replicate field", () => {
@@ -561,6 +754,100 @@ describe("Run schema", () => {
 		});
 		expect(index.runs).toHaveLength(1);
 		expect(index.runs[0]?.runId).toBe("run-1");
+	});
+
+	it("accepts aggregate Run ids and rejects path syntax in Run identities", () => {
+		const aggregateId = structuredClone(validRun);
+		aggregateId.runId = "29937467891+29967667026";
+		expect(parseRun(aggregateId).runId).toBe("29937467891+29967667026");
+
+		for (const runId of ["../outside", "nested/run", "nested\\run"]) {
+			const bad = structuredClone(validRun);
+			bad.runId = runId;
+			expect(() => parseRun(bad)).toThrow(/invalid Run/);
+		}
+	});
+
+	it("requires a RunIndex path to be the canonical path derived from its Run id", () => {
+		for (const path of ["runs/../runs/run-1.json", "runs/other.json", "../run-1.json"]) {
+			expect(() =>
+				parseRunIndex({
+					schemaVersion: "1",
+					runs: [{ runId: "run-1", generatedAt: "2026-06-20T00:00:00.000Z", path }],
+				}),
+			).toThrow(/invalid RunIndex/);
+		}
+	});
+
+	it("derives a replicate shard's path from its runId AND its replicate index", () => {
+		expect(runDocumentPath("run-1")).toBe("runs/run-1.json");
+		expect(runDocumentPath("run-1", 0)).toBe("runs/run-1-r0.json");
+
+		const index = parseRunIndex({
+			schemaVersion: "1",
+			runs: [
+				{
+					runId: "run-1",
+					generatedAt: "2026-06-20T00:00:00.000Z",
+					path: "runs/run-1-r2.json",
+					replicateIndex: 2,
+				},
+			],
+		});
+		expect(index.runs[0]?.replicateIndex).toBe(2);
+
+		// The suffix is not free-floating: it has to be the entry's OWN replicate index, and an entry
+		// that declares none is still held to the un-suffixed name.
+		for (const entry of [
+			{ path: "runs/run-1-r2.json", replicateIndex: 3 },
+			{ path: "runs/run-1-r2.json" },
+			{ path: "runs/run-2.json" },
+			{ path: "run-1.json" },
+		]) {
+			expect(() =>
+				parseRunIndex({
+					schemaVersion: "1",
+					runs: [{ runId: "run-1", generatedAt: "2026-06-20T00:00:00.000Z", ...entry }],
+				}),
+			).toThrow(/invalid RunIndex/);
+		}
+	});
+
+	// The single-sandbox lane (`bench-suite --replicate <idx>`) stamps a replicate index onto the Run
+	// but keeps the UN-suffixed filename, which commit-dataset.yml reads as the legacy shard shape. A
+	// one-name-per-identity rule outlaws that pairing, and the lane then dies at its final write —
+	// after the whole benchmark has run. Both names are legal for a replicate-stamped Run; a Run with
+	// no replicate index still has exactly one, which is what keeps the dataset invariant intact.
+	it("accepts either the suffixed or the un-suffixed name for a replicate-stamped Run", () => {
+		expect(runDocumentPaths("run-1")).toEqual(["runs/run-1.json"]);
+		expect(runDocumentPaths("run-1", 3)).toEqual(["runs/run-1-r3.json", "runs/run-1.json"]);
+
+		const index = parseRunIndex({
+			schemaVersion: "1",
+			runs: [
+				{
+					runId: "run-1",
+					generatedAt: "2026-06-20T00:00:00.000Z",
+					path: "runs/run-1.json",
+					replicateIndex: 3,
+				},
+			],
+		});
+		expect(index.runs[0]?.path).toBe("runs/run-1.json");
+	});
+
+	// The dataset index is the published artifact update-leaderboard.yml resolves a run through, and
+	// its entries never carry a replicate index (a promoted Run spans every replicate). Nothing about
+	// the shard names above may loosen what IT accepts.
+	it("still admits exactly one path for an entry that declares no replicate index", () => {
+		for (const path of ["runs/run-1-r0.json", "runs/run-1-r.json", "runs/run-1-rx.json"]) {
+			expect(() =>
+				parseRunIndex({
+					schemaVersion: "1",
+					runs: [{ runId: "run-1", generatedAt: "2026-06-20T00:00:00.000Z", path }],
+				}),
+			).toThrow(/invalid RunIndex/);
+		}
 	});
 
 	it("rejects a RunIndex that isn't newest-first", () => {

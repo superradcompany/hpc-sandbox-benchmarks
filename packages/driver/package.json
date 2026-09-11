@@ -1,0 +1,32 @@
+{
+  "name": "@sandbox-benchmarks/driver",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The arktype-free sandbox driver port and kit mechanics from ADR-0007. Runtime parsing is isolated on explicit schema subpaths; provider-specific sandbox-id validation belongs to each driver module.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts",
+    "./cli": "./src/cli.ts",
+    "./conformance": "./src/conformance.ts",
+    "./env": "./src/env.ts",
+    "./schemas": "./src/schemas.ts",
+    "./package.json": "./package.json",
+    "./computesdk": "./src/computesdk.ts",
+    "./native": "./src/native.ts",
+    "./errors": "./src/errors.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sandbox-benchmarks/schema": "workspace:*",
+    "arktype": "catalog:"
+  },
+  "devDependencies": {
+    "@repo/tsconfig": "workspace:*",
+    "typescript": "catalog:",
+    "@types/bun": "catalog:"
+  }
+}

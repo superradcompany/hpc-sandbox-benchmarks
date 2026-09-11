@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { buildDaytonaTemplate } from "./daytona.ts";
 import { buildE2bTemplate } from "./e2b.ts";
-import { templateProviders } from "./index.ts";
+import { templateBuilders, templateProviders } from "./index.ts";
 import { buildModalTemplate } from "./modal.ts";
 
 describe("@sandbox-benchmarks/templates", () => {
@@ -20,6 +20,18 @@ describe("@sandbox-benchmarks/templates", () => {
 	});
 
 	it("lists every provider that has a builder", () => {
+		// Vercel is deliberately absent: it boots the shared base mirrored into VCR, with no variant
+		// Dockerfile of its own. A builder here must correspond to a real images/<name>/Dockerfile.
 		expect([...templateProviders]).toEqual(["e2b", "daytona", "modal"]);
+	});
+
+	it("routes every advertised provider to a builder", () => {
+		// The build-template CLI used to keep its own copy of this map and drifted: it rejected
+		// `vercel` as Unknown while templateProviders advertised it. The CLI now imports
+		// templateBuilders directly, so this asserts the two views agree at their source.
+		for (const provider of templateProviders) {
+			expect(typeof templateBuilders[provider]).toBe("function");
+		}
+		expect(Object.keys(templateBuilders)).toEqual([...templateProviders]);
 	});
 });
