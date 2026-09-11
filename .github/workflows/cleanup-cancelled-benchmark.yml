@@ -1,0 +1,60 @@
+name: Cleanup cancelled benchmark 34607903095
+on:
+  push:
+    branches: [superrad-benchmarks]
+    paths: [.github/workflows/cleanup-cancelled-benchmark.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cleanup-benchmark-34607903095
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    if: github.repository == 'superradcompany/hpc-sandbox-benchmarks' && github.ref == 'refs/heads/superrad-benchmarks'
+    environment: privileged
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Remove the 52 explicitly authorized sandboxes
+        env:
+          MSB_API_URL: ${{ secrets.MSB_API_URL }}
+          MSB_API_KEY: ${{ secrets.MSB_API_KEY }}
+        shell: python
+        run: |
+          import concurrent.futures, datetime, json, os, time, urllib.request, urllib.error
+          IDS = ['00165715-153f-4e5c-91ad-c77c4a39ded5', '04e69e73-841b-47ec-93ec-474a6cb41e96', '0a18ecb6-05ba-4e25-9040-857471462ef2', '0d8278ba-6832-4bf7-872b-96983dae1a59', '0ddd8ff9-aee5-41de-b201-8ad2ca4cc3ec', '1a207e71-7a60-47bf-aabc-658e009cef3e', '1eebe0e5-e76c-425a-af25-280db5ba04f7', '2358cc02-15ce-4fff-94b9-1b4cc59b6dd2', '23e3c8f8-a844-4fdd-9237-3f2685ce801e', '26f67714-55fe-48d7-8da5-daa8397a6545', '2afb28a9-9bf1-4e77-a52d-a287f5151c2c', '321ab93d-ed90-4e76-a76d-e7933565626e', '32ec40db-5a72-41fa-b0e3-91dd00ea9eac', '349c17e1-8eef-4131-963b-18f398f067d2', '3b84fd62-c9f3-4861-828c-ccd1a89ad03f', '3e6c64af-03d0-41da-a865-176a4ce85286', '3e72ba16-6715-40a2-990d-57bb652ccabf', '3f769606-1eca-40c1-bc27-2740c2771f88', '3f78d2a1-5a3f-4bdd-afbb-b28fa584c93a', '41c5179c-c384-49ca-a9c6-f331d8b5cad4', '47c7fed3-0bb8-47a6-b23e-1eb8432cb8e7', '53435db6-6284-4755-a3bc-50f64e7a85f8', '5986effc-4063-40eb-8aff-8e40bfa9293d', '660eb52f-1a66-4c3b-91f2-558eece17d6d', '6674acea-bdcc-4c4a-bf08-9ef39c2e6498', '67ef2452-066c-4b4c-8c06-a0f0cb4380ad', '705e8f46-692b-41b0-9cf6-4a7cf76510b5', '733ea4e0-35f0-4cca-b4f9-329672fbb822', '86a4013a-e787-4f77-a4c3-5a9f8f1649fa', '8e6ec4e8-7e44-4971-a0fc-df10d83e180c', 'a2b8ea8b-7a40-475a-9317-c4d3dd5bad6b', 'a927cbab-9c4e-4e72-9e74-81763d417244', 'aacd149f-613c-43d4-a908-43aaa2940ec4', 'acc80e58-4fa9-4fe3-a270-52aeef890b0a', 'ae4f6413-e8ec-4330-bcf7-84a6e6eb7298', 'bacb6e3b-ce62-436b-934a-4bacfc3274f5', 'bbb19e08-4c64-4967-b1bb-81252733817e', 'beb1f7ea-99f7-4a89-af5c-51f7a37d1619', 'c4262a5c-b922-4d23-b744-2aa58fa24bc9', 'c73345aa-a991-4d60-98f3-c32a7ccc7649', 'c8bd83e8-5f8c-4ccd-a9b3-e9676ff84d8b', 'd075f633-f9a2-4820-ab54-25130a88c4e3', 'd0befc46-2edf-437a-a0d3-8e83c1d9cd2f', 'e719bff3-8381-45bc-a740-266740fb0b39', 'e89c6112-3d08-4c4d-9fea-b966090b01c9', 'ed647062-4f18-40d7-9947-636c7db37633', 'ede46587-ffdc-427e-b4f4-8e70601e5e55', 'f19734e3-3d21-461b-b0bb-36a99b437ea3', 'fac7fcf1-5536-4ed0-b5a3-cc1e2f5e1138', 'ffa3f4b0-f7cc-4a35-a581-a8c0bec1d779']
+          BASE = os.environ['MSB_API_URL'].rstrip('/')
+          assert BASE.startswith('https://')
+          if not BASE.endswith('/v1'): BASE += '/v1'
+          def request(sid, method='GET'):
+              r=urllib.request.Request(BASE+'/sandboxes/'+sid,method=method,headers={'Authorization':'Bearer '+os.environ['MSB_API_KEY']})
+              try:
+                  with urllib.request.urlopen(r,timeout=120) as response:return json.load(response)
+              except urllib.error.HTTPError as e:
+                  if e.code==404:return None
+                  raise RuntimeError(f'{method} {sid}: HTTP {e.code}') from None
+          validated=[]
+          EXTRA = {'e9e2284e-ee92-4891-a5d3-35be5f138e25': 'msb-live-demo', '9cb268cb-41dd-4984-8ba3-d2df6eb076b6': 'toks-1'}
+          for sid in [*IDS, *EXTRA]:
+              s=request(sid)
+              if s is None:continue
+              assert s['id']==sid and s['org_id']=='561e4943-7312-480d-8914-fa4c6eac3492'
+              if sid in EXTRA:
+                  assert s['name']==EXTRA[sid]
+              else:
+                  assert s['ephemeral'] is True and s['name'].startswith('bench-cloud-')
+                  assert s['spec']['labels'].get('sandbox-benchmarks.provider')=='microsandbox-cloud'
+                  created=datetime.datetime.fromisoformat(s['created_at'].replace('Z','+00:00')).timestamp()
+                  assert 1789135440 <= created <= 1789135470, 'Sandbox is outside the cancelled run creation window'
+              validated.append(sid)
+          print(f'Validated {len(validated)} explicitly authorized sandbox IDs',flush=True)
+          def remove(sid):
+              request(sid,'DELETE')
+              for _ in range(30):
+                  if request(sid) is None:return sid
+                  time.sleep(2)
+              raise RuntimeError('Sandbox still exists: '+sid)
+          with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+              for sid in pool.map(remove,validated):print('Removed '+sid,flush=True)
+          print('Cleanup complete')
