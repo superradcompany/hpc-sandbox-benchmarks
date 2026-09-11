@@ -17,7 +17,7 @@ jobs:
         shell: python
         run: |
           import concurrent.futures, datetime, json, os, time, urllib.request, urllib.error, urllib.parse
-          base = os.environ['MSB_API_URL'].rstrip('/')
+          base = (os.environ.get('MSB_API_URL') or 'https://api.microsandbox.dev').rstrip('/')
           assert base.startswith('https://')
           if not base.endswith('/v1'): base += '/v1'
           def request(path, method='GET'):
