@@ -157,6 +157,7 @@ jobs:
         with:
           # This cell only reads code (the sandbox clones via BENCH_REPO_TOKEN when set, not the
           # checkout's credentials), so don't persist the job token in .git/config.
+          ref: 4859756b28464a914d86cdd0f394bf78496486a3
           persist-credentials: false
 
       # Bun + `bun install --frozen-lockfile --ignore-scripts` (bunfig.toml's supply-chain posture),
@@ -230,7 +231,7 @@ jobs:
       # bin writes ONE job summary for the whole fleet (a row per replicate) + a run annotation.
       - name: Run suite and normalize
         env:
-          BENCH_REPO_REF: ${{ github.sha }}
+          BENCH_REPO_REF: 4859756b28464a914d86cdd0f394bf78496486a3
           # Optional once the repo is public (anonymous clone works). Still passed so private forks and
           # rate-limited clones keep working via the short-lived job token.
           BENCH_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -292,7 +293,7 @@ jobs:
           # >>> generated: provider-runner-lifetime — bun run generate-provider-wiring
           BENCH_RUNNER_LIFETIME_MINUTES: ${{ '' }}
           # <<< end generated: provider-runner-lifetime
-        run: bun apps/cli/src/bin/bench-suite.ts "$BENCH_PROVIDER" "$BENCH_SUITE" "$GITHUB_RUN_ID" --replicates "$BENCH_REPLICATES"
+        run: GITHUB_SHA=4859756b28464a914d86cdd0f394bf78496486a3 bun apps/cli/src/bin/bench-suite.ts "$BENCH_PROVIDER" "$BENCH_SUITE" "$GITHUB_RUN_ID" --replicates "$BENCH_REPLICATES"
 
       # Did THIS attempt actually produce shard Runs? The upload below overwrites the cell's artifact,
       # and overwriting is only safe when there is something to put in its place.

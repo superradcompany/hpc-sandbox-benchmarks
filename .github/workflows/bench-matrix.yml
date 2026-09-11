@@ -129,7 +129,7 @@ jobs:
   plan:
     name: Plan matrix
     if: >
-      github.repository == 'starslingdev/hpc-sandbox-benchmarks' &&
+      github.repository == 'superradcompany/hpc-sandbox-benchmarks' &&
       (github.ref == 'refs/heads/main' || inputs.allow_branch)
     runs-on: ubuntu-24.04
     outputs:
@@ -145,6 +145,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Planning only reads code; don't persist the job token in .git/config.
+          ref: 4859756b28464a914d86cdd0f394bf78496486a3
           persist-credentials: false
       - name: Set up workspace
         uses: ./.github/actions/setup-workspace
@@ -170,7 +171,7 @@ jobs:
     name: ${{ matrix.suite }}
     needs: plan
     if: >
-      github.repository == 'starslingdev/hpc-sandbox-benchmarks' &&
+      github.repository == 'superradcompany/hpc-sandbox-benchmarks' &&
       (github.ref == 'refs/heads/main' || inputs.allow_branch)
     # A called workflow's token can never exceed its caller's, so the id-token: write that
     # bench-suite.yml's cells need for Namespace's GitHub OIDC federation has to be granted here too.
