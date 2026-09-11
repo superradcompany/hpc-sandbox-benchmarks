@@ -229,6 +229,10 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 		const result = await session.exec("echo hi");
 		expect(result.exit).toEqual({ kind: "exited", code: 0 });
 		expect(result.stdout).toBe("ran:echo hi");
+		await session.launch?.("sleep 300");
+		expect(created.execs.at(-1)).toContain("nohup /bin/sh -lc 'sleep 300'");
+		expect(created.execs.at(-1)).toContain("</dev/null >/dev/null 2>&1 &");
+		expect(created.execs.at(-1)).toEndWith("exit 0");
 		expect(await session.files?.exists("/tmp/absent")).toBe(false);
 		await session.files?.writeText("/tmp/probe/file.txt", "payload");
 		expect(created.execs.at(-1)).toBe("mkdir -p '/tmp/probe'");

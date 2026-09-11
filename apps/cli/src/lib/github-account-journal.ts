@@ -119,8 +119,20 @@ export function githubGitRequest(env: NodeJS.ProcessEnv = process.env): GitReque
 			...(body === undefined ? {} : { body: JSON.stringify(body) }),
 			signal: AbortSignal.timeout(20_000),
 		});
-		if (!response.ok)
-			throw new Error(`account journal ${method} HTTP ${response.status}; allocation blocked`);
+		if (!response.ok) {
+			const payload: unknown = await response.json().catch(() => undefined);
+			const detail =
+				payload &&
+				typeof payload === "object" &&
+				"message" in payload &&
+				typeof payload.message === "string"
+					? payload.message.replaceAll(token, "[redacted]").slice(0, 1000)
+					: "no JSON error message";
+			const requestId = response.headers.get("x-github-request-id") ?? "unknown";
+			throw new Error(
+				`account journal ${method} HTTP ${response.status}: ${detail} (request ${requestId}); allocation blocked`,
+			);
+		}
 		return response.json();
 	};
 }

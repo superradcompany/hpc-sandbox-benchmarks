@@ -1,7 +1,7 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { type } from "arktype";
 import type { GitRequest } from "./github-account-journal.ts";
-import { githubAccountJournal } from "./github-account-journal.ts";
+import { githubAccountJournal, githubGitRequest } from "./github-account-journal.ts";
 
 const intent = {
 	version: "1",
@@ -110,4 +110,25 @@ test("a competing writer rejects the append rather than forcing the journal ref"
 	});
 	await expect(journal.append(intent)).rejects.toThrow("422");
 	await expect(journal.append({ ...intent, attempt: "attempt-2" })).rejects.toThrow("422");
+});
+
+test("journal rejection preserves GitHub's reason and request id without the token", async () => {
+	const fetch = spyOn(globalThis, "fetch").mockResolvedValue(
+		new Response(JSON.stringify({ message: "Update is not a fast forward: secret-token" }), {
+			status: 422,
+			headers: { "x-github-request-id": "test-request" },
+		}),
+	);
+	try {
+		const request = githubGitRequest({
+			GITHUB_REPOSITORY: "owner/repo",
+			GH_TOKEN: "secret-token",
+		});
+		await expect(request("PATCH", "/git/refs/heads/journal")).rejects.toThrow(
+			"HTTP 422: Update is not a fast forward: [redacted] (request test-request)",
+		);
+		expect(fetch).toHaveBeenCalledTimes(1);
+	} finally {
+		fetch.mockRestore();
+	}
 });
