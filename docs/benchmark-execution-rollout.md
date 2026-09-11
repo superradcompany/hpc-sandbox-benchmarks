@@ -160,3 +160,11 @@ first validates every queue configuration, then suppresses only actionlint's exa
 diagnostic. Tests reject invalid values and cancellation and check shared account group identity.
 All other actionlint rules remain enabled. Replace this compatibility path with a mise-pinned upstream
 release when it supports queues; do not broadly ignore workflow syntax errors.
+
+## Microsandbox Cloud in this fork
+
+Microsandbox recovery is scoped to benchmark ownership labels, with a legacy name
+fallback. Unrelated records in a shared organization do not block admission and
+are never removed. This differs from the dedicated-account policy above: unrelated
+workloads may consume shared quota. Journal checks for unknown creates and cleanup
+confirmation still apply. See [the driver README](../packages/microsandbox-cloud/README.md).

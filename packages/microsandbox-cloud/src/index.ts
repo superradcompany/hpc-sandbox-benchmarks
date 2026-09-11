@@ -45,7 +45,7 @@ export const MICROSANDBOX_NAME_PREFIX = "bench-cloud-";
 export const MICROSANDBOX_SANDBOX_ID = type(
 	/^bench-cloud-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
 );
-/** Vendor-console label written on every create; inventory ownership keys on the name shape. */
+/** Ownership label written on every benchmark sandbox. */
 export const MICROSANDBOX_LABEL_MARKER = "sandbox-benchmarks.provider";
 /** The longest suite budgets 155 minutes; leave setup and teardown margin, keep leaks self-expiring. */
 export const MICROSANDBOX_SANDBOX_LIFETIME_MS = 3 * 60 * 60_000;
@@ -99,9 +99,21 @@ function isConnectionError(error: unknown): boolean {
 	);
 }
 
-/** Owned iff the name is one this driver (or its legacy adapter) generated; labels are informational. */
+/** Recognize names from older benchmark runs without an ownership label. */
 export function isMicrosandboxOwned(name: string): boolean {
 	return !(MICROSANDBOX_SANDBOX_ID(name) instanceof type.errors);
+}
+
+/** An explicit label takes precedence over the legacy name fallback. */
+function ownsMicrosandbox(handle: MsbSandboxHandle): boolean {
+	let labels: Record<string, unknown> | undefined;
+	try {
+		labels = JSON.parse(handle.configJson).labels;
+	} catch {
+		// Older records may have no readable configuration.
+	}
+	const marker = labels?.[MICROSANDBOX_LABEL_MARKER];
+	return marker === undefined ? isMicrosandboxOwned(handle.name) : marker === "microsandbox-cloud";
 }
 
 async function execShell(
@@ -126,7 +138,8 @@ async function removeMicrosandbox(backend: DefaultBackend, name: string): Promis
 		// or the remove can be the call that first sees not-found.
 		try {
 			const handle = await MsbSandbox.get(name);
-			if (handle.name !== name) throw new Error("Microsandbox returned an unrelated sandbox");
+			if (handle.name !== name || !ownsMicrosandbox(handle))
+				throw new Error("Refusing to remove an unrelated Microsandbox sandbox");
 			if (handle.status !== "stopped") {
 				await handle.requestStop();
 				await handle.waitUntilStopped();
@@ -327,21 +340,17 @@ export function microsandboxProbes(
 	};
 }
 
-/** Whole-account inventory: every record, owned iff its name is one the benchmark generates. */
+/** Find benchmark leftovers without admitting unrelated organization resources. */
 export function microsandboxInventory(
 	backend: DefaultBackend,
 ): NonNullable<ComputeSdkDriverSpec<MicrosandboxCompute>["inventory"]> {
 	return {
 		list: async (_compute, options) => {
-			const owned: string[] = [];
-			let foreignCount = 0;
-			for (const handle of await listMicrosandboxes(backend, options)) {
-				// A stopped record is still an account resource (ours to remove, theirs to block on):
-				// remove() is the only transition that makes a record disappear from this listing.
-				if (isMicrosandboxOwned(handle.name)) owned.push(handle.name);
-				else foreignCount += 1;
-			}
-			return { owned, foreignCount };
+			// Keep the unfiltered scan until older name-only benchmark records are retired.
+			const owned = (await listMicrosandboxes(backend, options))
+				.filter(ownsMicrosandbox)
+				.map((handle) => handle.name);
+			return { owned, foreignCount: 0 };
 		},
 	};
 }
@@ -358,7 +367,7 @@ export function microsandboxCloudSpec({
 			? { kind: "cloud", apiKey: env.MSB_API_KEY }
 			: { kind: "cloud", url: env.MSB_API_URL, apiKey: env.MSB_API_KEY };
 	return computeSdkSpec(microsandboxCompute(backend), {
-		sandboxId: MICROSANDBOX_SANDBOX_ID,
+		sandboxId: type("string > 0"),
 		createOptions: {
 			coverage: MICROSANDBOX_REQUEST_COVERAGE,
 			map: (request, unsupported) => {
