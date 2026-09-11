@@ -28,7 +28,7 @@ jobs:
           assert BASE.startswith('https://')
           if not BASE.endswith('/v1'): BASE += '/v1'
           def request(sid, method='GET'):
-              r=urllib.request.Request(BASE+'/sandboxes/'+sid,method=method,headers={'Authorization':'Bearer '+os.environ['MSB_API_KEY']})
+              r=urllib.request.Request(BASE+'/sandboxes/'+sid,method=method,headers={'Authorization':'Bearer '+os.environ['MSB_API_KEY'],'User-Agent':'msb-benchmark-cleanup/1.0'})
               try:
                   with urllib.request.urlopen(r,timeout=120) as response:return json.load(response)
               except urllib.error.HTTPError as e:
