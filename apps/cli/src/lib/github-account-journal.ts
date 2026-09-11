@@ -21,6 +21,15 @@ export type GitRequest = (
 	body?: unknown,
 ) => Promise<unknown>;
 
+class GitHubRequestError extends Error {
+	constructor(
+		message: string,
+		readonly refConflict: boolean,
+	) {
+		super(message);
+	}
+}
+
 /** Durable evidence, not a distributed lock. Provision and protect the branch before account admission. */
 export function githubAccountJournal(
 	request: GitRequest,
@@ -84,7 +93,7 @@ export function githubAccountJournal(
 							parents: [state.head],
 						}),
 					);
-					// Retry only when another writer advanced the branch; never overwrite its records.
+					// Never force the branch update: another job may have appended records.
 					try {
 						const updated = reference.assert(
 							await request("PATCH", `/git/refs/heads/${branch}-${record.account}`, {
@@ -101,7 +110,18 @@ export function githubAccountJournal(
 							(entry) => entry.attempt === record.attempt && entry.kind === record.kind,
 						);
 						if (saved && JSON.stringify(saved) === JSON.stringify(record)) return;
-						if (saved || latest.head === state.head) throw error;
+						if (
+							saved ||
+							(error instanceof GitHubRequestError
+								? !error.refConflict
+								: latest.head === state.head)
+						)
+							throw error;
+						// A rejected ref update can be followed by an unchanged head. Re-read after a delay.
+						if (attempt < 31)
+							await new Promise((resolve) =>
+								setTimeout(resolve, Math.min(100 * 2 ** attempt, 1000) + Math.random() * 250),
+							);
 					}
 				}
 				throw new Error("account journal remained busy after 32 append attempts");
@@ -142,8 +162,13 @@ export function githubGitRequest(env: NodeJS.ProcessEnv = process.env): GitReque
 					? payload.message.replaceAll(token, "[redacted]").slice(0, 1000)
 					: "no JSON error message";
 			const requestId = response.headers.get("x-github-request-id") ?? "unknown";
-			throw new Error(
+			throw new GitHubRequestError(
 				`account journal ${method} HTTP ${response.status}: ${detail} (request ${requestId}); allocation blocked`,
+				method === "PATCH" &&
+					path.startsWith("/git/refs/heads/") &&
+					(response.status === 409 ||
+						(response.status === 422 &&
+							["Update is not a fast forward", "Reference cannot be updated"].includes(detail))),
 			);
 		}
 		return response.json();

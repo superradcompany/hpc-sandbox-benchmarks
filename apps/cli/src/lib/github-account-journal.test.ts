@@ -99,7 +99,7 @@ test("a transient append failure does not poison later appends or reads", async 
 	expect(await journal.read("tama")).toEqual([{ ...intent, attempt: "attempt-2" }]);
 	expect(f.writes).toHaveLength(1);
 });
-test("a competing writer rejects the append rather than forcing the journal ref", async () => {
+test("an unknown rejection fails without forcing the journal ref", async () => {
 	const f = fixture();
 	const journal = githubAccountJournal((method, path, body) => {
 		if (method === "PATCH") {
@@ -111,6 +111,64 @@ test("a competing writer rejects the append rather than forcing the journal ref"
 	await expect(journal.append(intent)).rejects.toThrow("422");
 	await expect(journal.append({ ...intent, attempt: "attempt-2" })).rejects.toThrow("422");
 });
+
+for (const [status, message] of [
+	[422, "Reference cannot be updated"],
+	[422, "Update is not a fast forward"],
+	[409, "Conflict"],
+] as const) {
+	test(`retries ${status} ${message} even when the head is unchanged`, async () => {
+		const f = fixture();
+		const fetch = spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(new Response(JSON.stringify({ message }), { status }))
+			.mockResolvedValueOnce(new Response(JSON.stringify({ message }), { status }));
+		try {
+			const github = githubGitRequest({ GITHUB_REPOSITORY: "owner/repo", GH_TOKEN: "token" });
+			let patches = 0;
+			const journal = githubAccountJournal((method, path, body) => {
+				if (method === "PATCH" && ++patches <= 2) {
+					expect(body).toMatchObject({ force: false });
+					return github(method, path, body);
+				}
+				return f.request(method, path, body);
+			});
+			await journal.append(intent);
+			expect(patches).toBe(3);
+			expect(await journal.read("tama")).toEqual([intent]);
+			expect(f.writes).toHaveLength(1);
+		} finally {
+			fetch.mockRestore();
+		}
+	});
+}
+
+for (const [status, message] of [
+	[403, "Resource not accessible by integration"],
+	[422, "Validation Failed"],
+] as const) {
+	test(`does not retry ${status} ${message} when another writer advances the head`, async () => {
+		const f = fixture();
+		const other = { ...intent, attempt: "other-job" };
+		const fetch = spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			new Response(JSON.stringify({ message }), { status }),
+		);
+		try {
+			const github = githubGitRequest({ GITHUB_REPOSITORY: "owner/repo", GH_TOKEN: "token" });
+			const journal = githubAccountJournal(async (method, path, body) => {
+				if (method === "PATCH") {
+					await githubAccountJournal(f.request).append(other);
+					return github(method, path, body);
+				}
+				return f.request(method, path, body);
+			});
+			await expect(journal.append(intent)).rejects.toThrow(message);
+			expect(fetch).toHaveBeenCalledTimes(1);
+			expect(await journal.read("tama")).toEqual([other]);
+		} finally {
+			fetch.mockRestore();
+		}
+	});
+}
 
 test("journal rejection preserves GitHub's reason and request id without the token", async () => {
 	const fetch = spyOn(globalThis, "fetch").mockResolvedValue(
