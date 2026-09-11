@@ -129,7 +129,7 @@ jobs:
     # with cores where the rest of the release — which only waits on registries and provider APIs — does
     # not. Only this job and `build` do local compute; the others stay on the 2-core standard. The 16-core
     # runner scaled the compile better still, but its queue times were prohibitive, so we run on 8.
-    runs-on: starsling-ubuntu-24.04-8
+    runs-on: ${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-8' }}
     # Every job caps its wall time. The default is GitHub's 6-hour ceiling, and each of these jobs makes
     # calls that can hang rather than fail (a registry pull, a provider SDK, a remote builder) — a hang
     # would otherwise hold a self-hosted runner for hours. Sized to a few times the observed run.
@@ -181,7 +181,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'starslingdev/hpc-sandbox-benchmarks'
-    runs-on: starsling-ubuntu-24.04-2
+    runs-on: ${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}
     # Validation + one registry probe; it should take a minute. A hang means the registry is wedged.
     timeout-minutes: 15
     permissions:
@@ -292,7 +292,7 @@ jobs:
     if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run-build == 'true'
     # 8 vCPUs — the same compile-bound base-image build as pr-gate (see the note there), and it sits on
     # the critical path of every release: nothing bakes until the candidate is pushed.
-    runs-on: starsling-ubuntu-24.04-8
+    runs-on: ${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-8' }}
     # The heavy phase: a full base-image build (apt, mise, the PTS install) plus the push.
     timeout-minutes: 60
     environment: privileged
@@ -390,7 +390,7 @@ jobs:
       needs.plan.result == 'success' &&
       needs.plan.outputs.skip != 'true' &&
       contains(fromJSON('["success", "skipped"]'), needs.build.result)
-    runs-on: starsling-ubuntu-24.04-2
+    runs-on: ${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}
     # Each cell boots a provider sandbox with that provider's secret — a credentialed job, so it runs
     # behind Environment `privileged` like the rest of the release lane.
     environment: privileged
@@ -607,7 +607,7 @@ jobs:
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/main' &&
       github.repository == 'starslingdev/hpc-sandbox-benchmarks'
-    runs-on: starsling-ubuntu-24.04-2
+    runs-on: ${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}
     environment: privileged
     # Re-validates and promotes every in-scope provider SERIALLY (it is a transaction, not a fan-out),
     # so at full scope it is the longest-running credentialed job. Sized for that worst case; a scoped
