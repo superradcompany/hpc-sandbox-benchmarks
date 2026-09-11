@@ -34,13 +34,13 @@ test("all current allocating workflows share account queues across variants and 
 		checkConcurrencyQueues(source);
 		return queueSchema.assert(schema.assert(Bun.YAML.parse(source)).jobs[job]?.concurrency);
 	};
-	// The per-cell group is a generated region rendered from the provider registry's quota domains
-	// (its content is pinned by the provider-wiring drift gate), so what this check owns is that
-	// every matrix lane queues on that ONE expression rather than a hand-maintained copy.
-	const bench = jobQueue("bench-suite.yml", "bench").group;
-	expect(bench).toStartWith("benchmark-account-${{ ");
-	expect(bench).toEndWith(" || matrix.provider }}");
-	expect(jobQueue("toolchain-image.yml", "bake").group).toBe(bench);
+	for (const file of ["bench-matrix.yml", "bench-smoke.yml"]) {
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions expression.
+		expect(jobQueue(file, "suite").group).toBe("benchmark-account-${{ matrix.account }}");
+	}
+	const bake = jobQueue("toolchain-image.yml", "bake").group;
+	expect(bake).toStartWith("benchmark-account-${{ ");
+	expect(bake).toEndWith(" || matrix.provider }}");
 	// The GPU lane is Modal-only and names the account directly: the registry's domain, not a literal
 	// that could survive a rename.
 	for (const job of ["prepare-assets", "prepare-kernels", "benchmark"])

@@ -76,6 +76,21 @@ export function workflowExperiment(env: NodeJS.ProcessEnv, createdOn: string): E
 				});
 		}
 	}
+	// All selected suites and replicas may run concurrently within an account.
+	for (const domain of new Set(cells.map((cell) => cell.quotaDomain))) {
+		const selected = cells.filter((cell) => cell.quotaDomain === domain);
+		const configured = capacity[domain];
+		if (
+			configured &&
+			(configured.sandboxes < selected.length ||
+				(configured.vcpus !== undefined &&
+					configured.vcpus < selected.reduce((n, cell) => n + cell.target.vcpus, 0)) ||
+				(configured.memoryGb !== undefined &&
+					configured.memoryGb < selected.reduce((n, cell) => n + cell.target.memoryGb, 0)))
+		)
+			throw new Error(`${domain}: account capacity cannot fit all parallel suites`);
+		capacity[domain] ??= { sandboxes: selected.length };
+	}
 	const plan = planExperiment({ id, sha, createdOn, cells }, capacity);
 	workflowAxes(plan);
 	for (const account of plan.accounts) workflowAxes(plan, account.quotaDomain);

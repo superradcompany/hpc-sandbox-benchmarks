@@ -226,3 +226,13 @@ test("a failed terminal upload does not discard its local immutable evidence or 
 	const retry = await executeExperimentBatch({ ...f.options, workflowAttempt: 2 });
 	expect(retry.every((attempt) => !attempt.measurementStarted)).toBe(true);
 });
+
+test("account preflight creates nothing; prepared suite jobs leave peer sandboxes alone", async () => {
+	const f = await fixture("preflight");
+	expect(await executeExperimentBatch({ ...f.options, recoveryOnly: true })).toEqual([]);
+	expect(f.events).toEqual([]);
+	f.present.add("active-peer");
+	await executeExperimentBatch({ ...f.options, accountPrepared: true });
+	expect(f.present.has("active-peer")).toBe(true);
+	expect(f.events.filter((e) => e === "create")).toHaveLength(2);
+});

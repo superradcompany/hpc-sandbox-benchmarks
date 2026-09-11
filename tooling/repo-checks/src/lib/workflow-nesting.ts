@@ -58,7 +58,9 @@ export function checkLaneDelegates(
 			const step = asRecord(rawStep, `${label}: malformed step`);
 			if (
 				typeof step.run === "string" &&
-				(step.run.includes(CELL_DRIVER_BIN) || step.run.includes("workflow-experiment.ts execute"))
+				(step.run.includes(CELL_DRIVER_BIN) ||
+					step.run.includes("workflow-experiment.ts execute") ||
+					step.run.includes('workflow-experiment.ts "$BENCH_OPERATION"'))
 			) {
 				errors.push(
 					`${label}: job "${jobId}" has a step whose run: invokes ${CELL_DRIVER_BIN} — ${cell}`,
@@ -145,10 +147,22 @@ export function checkExperimentNesting(docs: Record<string, unknown>): string[] 
 			`${file}: axis must come from frozen plan`,
 		);
 	}
+	const preparation = job("bench-account.yml", "prepare");
+	expect(
+		preparation.uses === "./.github/workflows/bench-suite.yml" &&
+			asRecord(preparation.with, "preparation").operation === "prepare",
+		"account must recover before parallel suites",
+	);
+	const dependencies = job("bench-account.yml", "execute").needs;
+	expect(
+		Array.isArray(dependencies) && dependencies.includes("prepare"),
+		"suite jobs must wait for account recovery",
+	);
 	const worker = job("bench-suite.yml", "bench");
+	expect(worker.concurrency === undefined, "suite jobs must not serialize within an account");
 	const step = stepByName(worker, RUN_STEP, "bench-suite.yml");
 	expect(
-		step?.run === "bun apps/cli/src/bin/workflow-experiment.ts execute",
+		step?.run === 'bun apps/cli/src/bin/workflow-experiment.ts "$BENCH_OPERATION"',
 		"worker must use managed batch executor",
 	);
 	expect(

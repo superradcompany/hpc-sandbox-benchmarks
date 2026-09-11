@@ -43,6 +43,9 @@ export interface BatchExecution {
 	root: string;
 	workflowAttempt: number;
 	job: string;
+	/** Recovery runs once in the account preflight before parallel suite jobs. */
+	accountPrepared?: boolean;
+	recoveryOnly?: boolean;
 	journal: AccountJournal;
 	store: Pick<ExperimentStore, "upload">;
 	open?: (provider: ProviderId) => Promise<OpenedDriver>;
@@ -88,19 +91,25 @@ export async function executeExperimentBatch(
 		const recoveryMs = startupDeadline - Date.now();
 		if (recoveryMs <= 0) throw new Error("startup deadline exceeded before account recovery");
 		const signal = AbortSignal.timeout(recoveryMs);
-		await recoverAccount(
-			batch.quotaDomain,
-			new Map([...drivers].map(([id, opened]) => [id, opened.driver])),
-			options.journal,
-			signal,
-		);
+		if (!options.accountPrepared) {
+			await recoverAccount(
+				batch.quotaDomain,
+				new Map([...drivers].map(([id, opened]) => [id, opened.driver])),
+				options.journal,
+				signal,
+			);
+			await reconcileAccount(
+				[...drivers].map(([id, opened]) => ({ id, driver: opened.driver })),
+				{ timeoutMs: Math.max(1, startupDeadline - Date.now()), signal },
+			);
+		}
 		history = await withinSignal(startupSignal, () => options.journal.read(batch.quotaDomain));
-		await reconcileAccount(
-			[...drivers].map(([id, opened]) => ({ id, driver: opened.driver })),
-			{ timeoutMs: Math.max(1, startupDeadline - Date.now()), signal },
-		);
 	} catch (error) {
 		admissionFailure = error;
+	}
+	if (options.recoveryOnly) {
+		if (admissionFailure !== undefined) throw admissionFailure;
+		return [];
 	}
 	const results = await Promise.allSettled(
 		cells.map(async (cell) => {

@@ -32,7 +32,12 @@ if (import.meta.main) {
 			const axis = workflowAxes(plan, account, round);
 			if (!process.env.GITHUB_OUTPUT) throw new Error("workflow output file is required");
 			appendFileSync(process.env.GITHUB_OUTPUT, `axis=${JSON.stringify(axis)}\n`);
-		} else if (command === "execute") {
+			if (account && !round) {
+				const firstRound = plan.rounds.find((entry) => entry.quotaDomain === account);
+				const first = workflowAxes(plan, account, firstRound?.id)[0];
+				appendFileSync(process.env.GITHUB_OUTPUT, `preflight=${JSON.stringify(first)}\n`);
+			}
+		} else if (command === "execute" || command === "prepare") {
 			if (process.env.BENCH_CELL_BUDGET_MINUTES !== "180")
 				throw new Error("worker must preserve the 180-minute job ceiling");
 			const batchId = process.env.BENCH_BATCH_ID;
@@ -49,6 +54,8 @@ if (import.meta.main) {
 			const attempts = await executeExperimentBatch({
 				plan,
 				batchId,
+				accountPrepared: command === "execute",
+				recoveryOnly: command === "prepare",
 				root: join(root, "attempts"),
 				workflowAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
 				job: process.env.GITHUB_JOB ?? "unknown",
@@ -56,7 +63,7 @@ if (import.meta.main) {
 				journal: githubAccountJournal(githubGitRequest()),
 			});
 			await exitAfterSandboxCleanup(
-				batchIsComplete(plan, join(root, "attempts"), attempts) ? 0 : 1,
+				command === "prepare" || batchIsComplete(plan, join(root, "attempts"), attempts) ? 0 : 1,
 			);
 		} else if (command === "collect") {
 			await downloadExperimentAttempts(

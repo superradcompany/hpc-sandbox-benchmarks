@@ -281,7 +281,7 @@ test("the integrated workflow gate rejects parallel rounds, serialised batches, 
 		],
 		["fromJSON(needs.plan.outputs.accounts)", "fromJSON(needs.plan.outputs.suites)"],
 		["data/dataset experiment/manifest/plan.json experiment/attempts", "data/dataset"],
-		["workflow-experiment.ts execute", "bench-suite.ts"],
+		["workflow-experiment.ts", "bench-suite.ts"],
 	] as const) {
 		expect(source).toContain(before);
 		expect(

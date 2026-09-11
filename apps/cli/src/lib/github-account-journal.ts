@@ -55,43 +55,56 @@ export function githubAccountJournal(
 		append(raw) {
 			const record = accountRecordSchema.assert(raw);
 			const pending = tail.then(async () => {
-				const state = await snapshot(record.account);
-				const path = "journal.json";
-				if (
-					state.journal.records.some(
-						(entry) => entry.attempt === record.attempt && entry.kind === record.kind,
+				for (let attempt = 0; attempt < 32; attempt++) {
+					const state = await snapshot(record.account);
+					const path = "journal.json";
+					if (
+						state.journal.records.some(
+							(entry) => entry.attempt === record.attempt && entry.kind === record.kind,
+						)
 					)
-				)
-					throw new Error("immutable journal record already exists");
-				const nextTree = object.assert(
-					await request("POST", "/git/trees", {
-						base_tree: state.baseTree,
-						tree: [
-							{
-								path,
-								mode: "100644",
-								type: "blob",
-								content: `${JSON.stringify({ ...state.journal, records: [...state.journal.records, record] })}\n`,
-							},
-						],
-					}),
-				);
-				const nextCommit = object.assert(
-					await request("POST", "/git/commits", {
-						message: `Record ${record.account} ${record.attempt} ${record.kind}`,
-						tree: nextTree.sha,
-						parents: [state.head],
-					}),
-				);
-				// Never force: another writer advancing the branch makes this append fail closed.
-				const updated = reference.assert(
-					await request("PATCH", `/git/refs/heads/${branch}-${record.account}`, {
-						sha: nextCommit.sha,
-						force: false,
-					}),
-				);
-				if (updated.object.sha !== nextCommit.sha)
-					throw new Error("journal append was not acknowledged");
+						throw new Error("immutable journal record already exists");
+					const nextTree = object.assert(
+						await request("POST", "/git/trees", {
+							base_tree: state.baseTree,
+							tree: [
+								{
+									path,
+									mode: "100644",
+									type: "blob",
+									content: `${JSON.stringify({ ...state.journal, records: [...state.journal.records, record] })}\n`,
+								},
+							],
+						}),
+					);
+					const nextCommit = object.assert(
+						await request("POST", "/git/commits", {
+							message: `Record ${record.account} ${record.attempt} ${record.kind}`,
+							tree: nextTree.sha,
+							parents: [state.head],
+						}),
+					);
+					// Retry only when another writer advanced the branch; never overwrite its records.
+					try {
+						const updated = reference.assert(
+							await request("PATCH", `/git/refs/heads/${branch}-${record.account}`, {
+								sha: nextCommit.sha,
+								force: false,
+							}),
+						);
+						if (updated.object.sha !== nextCommit.sha)
+							throw new Error("journal append was not acknowledged");
+						return;
+					} catch (error) {
+						const latest = await snapshot(record.account);
+						const saved = latest.journal.records.find(
+							(entry) => entry.attempt === record.attempt && entry.kind === record.kind,
+						);
+						if (saved && JSON.stringify(saved) === JSON.stringify(record)) return;
+						if (saved || latest.head === state.head) throw error;
+					}
+				}
+				throw new Error("account journal remained busy after 32 append attempts");
 			});
 			// The chain only orders appends; it must not carry their outcomes. A rejected tail would skip
 			// every later append's callback and fail every read with the first (possibly transient)

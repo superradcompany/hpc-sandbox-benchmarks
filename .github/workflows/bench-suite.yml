@@ -11,6 +11,9 @@ on:
         description: 'Suite to run — the bench-suite.ts arg and the artifact-name key. A registered SUITE_NAMES value.'
         required: true
         type: string
+      operation:
+        type: string
+        default: execute
       batch_id:
         description: 'Immutable experiment batch identity.'
         type: string
@@ -23,12 +26,6 @@ permissions:
 
 jobs:
   bench:
-    concurrency:
-      # >>> generated: provider-account-group-bench — bun run generate-provider-wiring
-      group: benchmark-account-${{ (matrix.provider == 'daytona-vm' || matrix.provider == 'daytona-container') && 'daytona' || (matrix.provider == 'modal-gvisor' || matrix.provider == 'modal-vm') && 'modal' || matrix.provider }}
-      # <<< end generated: provider-account-group-bench
-      cancel-in-progress: false
-      queue: max
     name: ${{ matrix.provider }}
     environment: privileged
     # >>> generated: provider-runner — bun run generate-provider-wiring
@@ -92,6 +89,7 @@ jobs:
           BENCH_PROVIDER: ${{ matrix.provider }}
           BENCH_SUITE: ${{ inputs.suite }}
           BENCH_CELL_BUDGET_MINUTES: '180'
+          BENCH_OPERATION: ${{ inputs.operation }}
           BENCH_BATCH_ID: ${{ inputs.batch_id }}
           GH_TOKEN: ${{ github.token }}
           # >>> generated: provider-inputs-bench — bun run generate-provider-wiring
@@ -123,10 +121,10 @@ jobs:
           # >>> generated: provider-runner-lifetime — bun run generate-provider-wiring
           BENCH_RUNNER_LIFETIME_MINUTES: ${{ '' }}
           # <<< end generated: provider-runner-lifetime
-        run: bun apps/cli/src/bin/workflow-experiment.ts execute
+        run: bun apps/cli/src/bin/workflow-experiment.ts "$BENCH_OPERATION"
 
       - name: Upload Run + raw results
-        if: always()
+        if: always() && inputs.operation == 'execute'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: diagnostic-${{ inputs.batch_id }}-${{ matrix.provider }}-attempt-${{ github.run_attempt }}-${{ github.run_id }}

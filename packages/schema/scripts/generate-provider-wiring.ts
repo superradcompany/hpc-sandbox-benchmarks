@@ -369,11 +369,6 @@ export function generatedProviderRegions(): GeneratedRegion[] {
 			body: renderSmokeProviderOptions(),
 		},
 		{
-			file: ".github/workflows/bench-suite.yml",
-			label: "provider-account-group-bench",
-			body: renderAccountConcurrencyGroup(),
-		},
-		{
 			file: ".github/workflows/toolchain-image.yml",
 			label: "provider-account-group-bake",
 			body: renderAccountConcurrencyGroup(),

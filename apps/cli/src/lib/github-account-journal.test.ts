@@ -132,3 +132,19 @@ test("journal rejection preserves GitHub's reason and request id without the tok
 		fetch.mockRestore();
 	}
 });
+
+test("a competing client advances the journal and both records survive", async () => {
+	const f = fixture();
+	const other = { ...intent, attempt: "other-job" };
+	let raced = false;
+	const journal = githubAccountJournal(async (method, path, body) => {
+		if (method === "PATCH" && !raced) {
+			raced = true;
+			await githubAccountJournal(f.request).append(other);
+			throw new Error("non-fast-forward");
+		}
+		return f.request(method, path, body);
+	});
+	await journal.append(intent);
+	expect(await githubAccountJournal(f.request).read("tama")).toEqual([other, intent]);
+});

@@ -17,6 +17,7 @@ jobs:
       actions: read
     outputs:
       axis: ${{ steps.plan.outputs.axis }}
+      preflight: ${{ steps.plan.outputs.preflight }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,8 +31,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BENCH_ACCOUNT: ${{ inputs.account }}
         run: bun apps/cli/src/bin/workflow-experiment.ts axes "$BENCH_ACCOUNT"
-  execute:
+  prepare:
     needs: plan
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/bench-suite.yml
+    with:
+      providers: ${{ toJSON(fromJSON(format('["{0}"]', fromJSON(needs.plan.outputs.preflight).provider))) }}
+      suite: account-recovery
+      batch_id: ${{ fromJSON(needs.plan.outputs.preflight).batch }}
+      operation: prepare
+    secrets: inherit
+  execute:
+    needs: [plan, prepare]
     permissions:
       contents: write
       actions: read
