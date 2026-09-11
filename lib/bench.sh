@@ -1039,15 +1039,44 @@ run_pinned_pts() {
 # versionless install resolving to a newer upstream fio would silently unmap every description. Keep
 # in lockstep with packages/schema/src/pts-profiles/fio-2.1.0 (and the golden fixture) when bumping.
 # Usage: run_fio_pts <type-name> <block-size-name> <results-prefix>   (e.g. "Sequential Read" 1MB pts_fio-seq-read)
-run_fio_pts() {
+run_fio_pts() (
 	local type_name="$1" bs_name="$2" prefix="$3"
+	if ! have phoronix-test-suite; then
+		skip_result "phoronix-test-suite not installed" "$prefix"
+		return 0
+	fi
+	# Preload a corrected parser for this fio invocation, including on read-only system installs.
+	local parser launcher scratch
+	launcher="$(command -v phoronix-test-suite)"
+	parser="$(dirname "$(readlink -f "$launcher")")/pts-core/objects/pts_test_result_parser.php"
+	if [ ! -f "$parser" ]; then
+		parser=/usr/share/phoronix-test-suite/pts-core/objects/pts_test_result_parser.php
+	fi
+	scratch="$(mktemp -d)"
+	trap 'rm -rf "$scratch"' EXIT
+	node "${REPO_ROOT}/lib/pts/fio/parser-patch.mjs" "$parser" "$scratch/parser.php" || return 1
+	export BENCH_FIO_PARSER="$scratch/parser.php"
+	export BENCH_FIO_PHP="${PHP_BIN:-$(command -v php)}"
+	cat > "$scratch/php" <<'FIO_PHP'
+#!/bin/sh
+exec "$BENCH_FIO_PHP" -d "auto_prepend_file=$BENCH_FIO_PARSER" "$@"
+FIO_PHP
+	chmod +x "$scratch/php"
+	export PHP_BIN="$scratch/php"
+	# Only the result definitions change; keep the already installed fio executable.
+	pts_init
+	local profile_dir
+	profile_dir="$(pts_user_dir)/test-profiles/pts/fio-2.1.0"
+	mkdir -p "$profile_dir"
+	cp -R "${REPO_ROOT}/packages/schema/src/pts-profiles/fio-2.1.0/." "$profile_dir/"
+
 	local direct
 	direct="$(fio_direct_choice)"
 	echo "fio scenario: Type=${type_name} Block Size=${bs_name} Direct=${direct} (O_DIRECT probe)"
 
 	run_pinned_pts "pts/fio-2.1.0" "$prefix" \
 		"fio.type=${type_name};fio.engine=Linux AIO;fio.direct=${direct};fio.size=${bs_name};fio.cpu-threads=0;fio.auto-disk-mount-points=Default Test Directory"
-}
+)
 
 # Run one realworld suite end to end: gate on the toolchain, install the repo-local profile with
 # the SHARED install.sh + runner overlaid from lib/pts/realworld/ (the profiles vendor only
