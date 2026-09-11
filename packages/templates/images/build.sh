@@ -66,7 +66,7 @@ bun "${HERE}/../src/manifest.ts" > "${HERE}/base/toolchain-manifest.json"
 # Authenticate downloads without storing the token in an image layer.
 secret_args=()
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-	secret_args+=(--secret id=github_token,env=GITHUB_TOKEN)
+	secret_args+=(--secret "id=github_token,env=GITHUB_TOKEN")
 fi
 
 echo ">>> building base: ${base_dev_tag} (+ ${base_ref})"
