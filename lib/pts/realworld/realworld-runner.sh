@@ -15,6 +15,11 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "${SCRIPT_DIR}/target.env"
 
+# PTS supplies HOME with a trailing slash, which breaks home-relative path assertions.
+while [ "${HOME%/}" != "$HOME" ] && [ "$HOME" != / ]; do
+	export HOME="${HOME%/}"
+done
+
 WORK_DIR="${SCRIPT_DIR}/work"
 
 # Fixed env, never ambient-HOME-dependent, so PTS's env quirks (it runs tests under varying HOME

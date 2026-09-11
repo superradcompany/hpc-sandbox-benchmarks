@@ -120,7 +120,10 @@ async function execShell(
 	sandbox: MsbSandbox,
 	command: string,
 ): Promise<{ readonly exitCode: number; readonly stdout: string; readonly stderr: string }> {
-	const output = await sandbox.execWith("/bin/sh", (builder) => builder.args(["-c", command]));
+	const output = await sandbox.execWith("/bin/sh", (builder) =>
+		// OpenClaw's unit tests exhaust the guest's default 4,096-descriptor hard limit.
+		builder.args(["-c", command]).rlimitRange("nofile", 65_536, 65_536),
+	);
 	return { exitCode: output.code, stdout: output.stdout(), stderr: output.stderr() };
 }
 
@@ -421,8 +424,24 @@ export function microsandboxCloudSpec({
 				return { status: "destroyed" };
 			},
 		},
-		prepareAndVerifyCreatedRequest: (_sandbox, native, request, options) =>
-			verifyMicrosandboxResources(native, request, options),
+		prepareAndVerifyCreatedRequest: async (_sandbox, native, request, options) => {
+			const verification = await verifyMicrosandboxResources(native, request, options);
+			if (verification.status !== "honored") return verification;
+			// Supply standard device links missing from guest initialization in msb 0.6.18.
+			const setup = await execShell(
+				native,
+				[
+					"set -e",
+					...["stdin", "stdout", "stderr"].map(
+						(name, fd) =>
+							`if [ ! -e /dev/${name} ] && [ ! -L /dev/${name} ]; then ln -s /proc/self/fd/${fd} /dev/${name}; fi`,
+					),
+				].join("\n"),
+			);
+			if (setup.exitCode !== 0)
+				throw new Error(`Microsandbox device link setup failed: ${setup.stderr}`);
+			return verification;
+		},
 		hasWorkingFilesystem: true,
 		probes: microsandboxProbes(backend),
 		inventory: microsandboxInventory(backend),

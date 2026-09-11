@@ -51,6 +51,7 @@ afterEach(() => {
  *  returns for a created sandbox) and whose exec echoes its script. */
 function fakeNative(name: string, diskSizeMib = 40960) {
 	const execs: string[] = [];
+	const limits: Array<[string, number, number]> = [];
 	const files = new Map<string, string>();
 	const native = {
 		name,
@@ -61,6 +62,10 @@ function fakeNative(name: string, diskSizeMib = 40960) {
 		execWith: async (_cmd: string, configure: (b: unknown) => unknown) => {
 			let script = "";
 			const builder = {
+				rlimitRange: (resource: string, soft: number, hard: number) => {
+					limits.push([resource, soft, hard]);
+					return builder;
+				},
 				args: (args: string[]) => {
 					script = args[1] ?? "";
 					return builder;
@@ -86,7 +91,7 @@ function fakeNative(name: string, diskSizeMib = 40960) {
 			},
 		}),
 	};
-	return { native: native as unknown as MsbSandbox, execs, files };
+	return { native: native as unknown as MsbSandbox, execs, files, limits };
 }
 
 /** A builder Proxy that records every setter call and resolves `create` to the given native. */
@@ -221,8 +226,12 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 			label: [MICROSANDBOX_LABEL_MARKER, "microsandbox-cloud"],
 		});
 		expect(calls.map(([name]) => name)).not.toContain("envs");
-		// Verification reads the record's own config; no in-guest command runs before the first exec.
-		expect(created.execs).toEqual([]);
+		// Prepare standard device links before exposing the sandbox to benchmark commands.
+		expect(created.execs).toHaveLength(1);
+		for (const [fd, name] of ["stdin", "stdout", "stderr"].entries()) {
+			expect(created.execs[0]).toContain(`ln -s /proc/self/fd/${fd} /dev/${name}`);
+			expect(created.execs[0]).toContain(`[ ! -e /dev/${name} ] && [ ! -L /dev/${name} ]`);
+		}
 		// The credential lives in the backend selection only — never in a builder call.
 		expect(JSON.stringify(calls)).not.toContain("msb_test-key");
 
@@ -230,6 +239,11 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 		expect(result.exit).toEqual({ kind: "exited", code: 0 });
 		expect(result.stdout).toBe("ran:echo hi");
 		await session.launch?.("sleep 300");
+		expect(created.limits).toEqual([
+			["nofile", 65_536, 65_536], // Guest setup.
+			["nofile", 65_536, 65_536], // Foreground command.
+			["nofile", 65_536, 65_536], // Detached command and its children.
+		]);
 		expect(created.execs.at(-1)).toContain("nohup /bin/sh -lc 'sleep 300'");
 		expect(created.execs.at(-1)).toContain("</dev/null >/dev/null 2>&1 &");
 		expect(created.execs.at(-1)).toEndWith("exit 0");
@@ -309,11 +323,13 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 
 	test("surfaces a command that never reached the guest instead of synthesizing an exit", async () => {
 		let execs = 0;
+		let ready = false;
 		const native = {
 			name: "pending",
 			// The listed-record config shape: verification must read the allocation from it as well.
 			config: async () => ({ resources: { diskSizeMib: 40960, memoryMib: 8192, vcpus: 4 } }),
 			execWith: async () => {
+				if (!ready) return { code: 0, stdout: () => "", stderr: () => "" };
 				execs += 1;
 				throw new IoError("connection closed after acceptance");
 			},
@@ -326,6 +342,7 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 			}),
 		);
 		const session = await microsandboxCloud.driver(context).create(request);
+		ready = true;
 		// A synthesized exit would leave a detached launch polled for until the step budget expired,
 		// and the command must not be replayed either: exactly one exec attempt, then a typed failure.
 		await expect(session.exec("touch /tmp/must-run-once")).rejects.toMatchObject({
