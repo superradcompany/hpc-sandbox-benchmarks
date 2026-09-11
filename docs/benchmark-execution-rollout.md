@@ -168,3 +168,11 @@ fallback. Unrelated records in a shared organization do not block admission and
 are never removed. This differs from the dedicated-account policy above: unrelated
 workloads may consume shared quota. Journal checks for unknown creates and cleanup
 confirmation still apply. See [the driver README](../packages/microsandbox-cloud/README.md).
+
+## Uncapped replica batches
+
+Set `BENCH_ACCOUNT_CAPACITY` to
+`{"microsandbox-cloud":{"sandboxes":"all"}}` to allow every planned replica
+in a batch. Omit CPU and memory limits to avoid imposing another cap.
+The frozen plan resolves "all" to the account's planned cell count.
+Per-account batch serialization still applies; this does not run different suites together.

@@ -3,7 +3,7 @@ import type { ExperimentCell, ExperimentPlan } from "@sandbox-benchmarks/schema"
 import { experimentCellSchema } from "@sandbox-benchmarks/schema";
 
 export interface AccountCapacity {
-	sandboxes: number;
+	sandboxes: number | "all";
 	vcpus?: number;
 	memoryGb?: number;
 	gpus?: number;
@@ -30,11 +30,23 @@ export function planExperiment(
 	policy: Readonly<Record<string, AccountCapacity>> = {},
 ): ExperimentPlan {
 	const cells = request.cells.map((cell) => experimentCellSchema.assert(structuredClone(cell)));
+	const capacities = Object.fromEntries(
+		Object.entries(policy).map(([domain, capacity]) => [
+			domain,
+			{
+				...capacity,
+				sandboxes:
+					capacity.sandboxes === "all"
+						? Math.max(1, cells.filter((cell) => cell.quotaDomain === domain).length)
+						: capacity.sandboxes,
+			},
+		]),
+	);
 	const batches: ExperimentPlan["batches"] = [];
 	for (const cell of cells) {
 		if (cell.metrics.every((metric) => cell.exclusions.some((entry) => entry.metricId === metric)))
 			continue;
-		const capacity = policy[cell.quotaDomain] ?? { sandboxes: 1 };
+		const capacity = capacities[cell.quotaDomain] ?? { sandboxes: 1 };
 		if (
 			!Number.isSafeInteger(capacity.sandboxes) ||
 			capacity.sandboxes < 1 ||
@@ -89,7 +101,7 @@ export function planExperiment(
 	}
 	const accounts = [...new Set(cells.map((cell) => cell.quotaDomain))].map((quotaDomain) => ({
 		quotaDomain,
-		...(policy[quotaDomain] ?? { sandboxes: 1 }),
+		...(capacities[quotaDomain] ?? { sandboxes: 1 }),
 	}));
 	const body = {
 		schemaVersion: "1" as const,

@@ -490,3 +490,22 @@ test("unverified GPU capacity and mixed workload revisions fail admission", () =
 		}),
 	).toThrow("inconsistent comparison cohort");
 });
+
+test("all capacity allows more than twelve replicas in one batch", () => {
+	const cells = Array.from({ length: 54 }, (_, i) => cell(i));
+	const result = planExperiment(
+		{ id: "all-replicas", sha, createdOn: "2026-09-11", cells },
+		{ "e2b-benchmark": { sandboxes: "all" } },
+	);
+	expect(result.batches).toHaveLength(1);
+	expect(result.batches[0]?.cells).toHaveLength(54);
+	expect(result.accounts[0]?.sandboxes).toBe(54);
+});
+
+test("all capacity still honors explicit resource limits", () => {
+	const result = planExperiment(
+		{ id: "resource-limit", sha, createdOn: "2026-09-11", cells: [cell(0), cell(1), cell(2)] },
+		{ "e2b-benchmark": { sandboxes: "all", vcpus: 8, memoryGb: 16 } },
+	);
+	expect(result.batches.map((batch) => batch.cells.length)).toEqual([2, 1]);
+});
