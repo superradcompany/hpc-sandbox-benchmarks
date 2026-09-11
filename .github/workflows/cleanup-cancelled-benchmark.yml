@@ -1,5 +1,8 @@
 name: Cleanup cancelled benchmark 34607903095
 on:
+  push:
+    branches: [superrad-benchmarks]
+    paths: [.github/workflows/cleanup-cancelled-benchmark.yml]
   workflow_dispatch:
 permissions:
   contents: read
