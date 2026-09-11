@@ -152,7 +152,7 @@ export const experimentRequestSchema = type({
 }).onUndeclaredKey("reject");
 export const accountCapacityPolicySchema = type({
 	"[string]": {
-		sandboxes: "number.integer >= 1 | 'all'",
+		sandboxes: "number.integer >= 1",
 		"vcpus?": "number.safe > 0",
 		"memoryGb?": "number.safe > 0",
 		"gpus?": "number.integer >= 0",

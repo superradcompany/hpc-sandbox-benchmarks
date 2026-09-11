@@ -3,7 +3,7 @@ import type { ExperimentCell, ExperimentPlan } from "@sandbox-benchmarks/schema"
 import { experimentCellSchema } from "@sandbox-benchmarks/schema";
 
 export interface AccountCapacity {
-	sandboxes: number | "all";
+	sandboxes: number;
 	vcpus?: number;
 	memoryGb?: number;
 	gpus?: number;
@@ -30,18 +30,11 @@ export function planExperiment(
 	policy: Readonly<Record<string, AccountCapacity>> = {},
 ): ExperimentPlan {
 	const cells = request.cells.map((cell) => experimentCellSchema.assert(structuredClone(cell)));
-	const capacities = Object.fromEntries(
-		Object.entries(policy).map(([domain, capacity]) => [
-			domain,
-			{
-				...capacity,
-				sandboxes:
-					capacity.sandboxes === "all"
-						? Math.max(1, cells.filter((cell) => cell.quotaDomain === domain).length)
-						: capacity.sandboxes,
-			},
-		]),
-	);
+	const capacities = { ...policy };
+	const microsandboxCells = cells.filter((cell) => cell.provider === "microsandbox-cloud");
+	if (microsandboxCells.length > 0) {
+		capacities["microsandbox-cloud"] = { sandboxes: microsandboxCells.length };
+	}
 	const batches: ExperimentPlan["batches"] = [];
 	for (const cell of cells) {
 		if (cell.metrics.every((metric) => cell.exclusions.some((entry) => entry.metricId === metric)))
@@ -65,7 +58,24 @@ export function planExperiment(
 		if (cap < 1) throw new Error(`target exceeds account capacity: ${cell.id}`);
 		const budgetMinutes = cell.startupMinutes + cell.workloadMinutes + cell.finishMinutes + 15;
 		if (budgetMinutes > 180) throw new Error(`replicate cannot fit a 180-minute job: ${cell.id}`);
-		// A batch is one simultaneous wave of identical requests. Never hide serial waves in a job.
+		// One Microsandbox batch owns recovery and launches every suite concurrently.
+		if (cell.provider === "microsandbox-cloud") {
+			const existing = batches.find((batch) => batch.quotaDomain === cell.quotaDomain);
+			if (existing) {
+				existing.cells.push(cell.id);
+				existing.budgetMinutes = Math.max(existing.budgetMinutes, budgetMinutes);
+			} else {
+				batches.push({
+					id: `batch-${batches.length}`,
+					quotaDomain: cell.quotaDomain,
+					cells: [cell.id],
+					maxConcurrency: cap,
+					budgetMinutes,
+				});
+			}
+			continue;
+		}
+		// Other providers retain their configured suite batches.
 		const previous = batches.at(-1);
 		const first = cells.find((entry) => entry.id === previous?.cells[0]);
 		if (

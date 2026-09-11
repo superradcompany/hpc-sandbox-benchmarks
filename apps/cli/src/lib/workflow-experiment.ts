@@ -105,6 +105,10 @@ export function workflowAxes(plan: ExperimentPlan, account?: string, round?: str
 		const cell = plan.cells.find((entry) => entry.id === batch?.cells[0]);
 		if (!batch || !cell || batch.quotaDomain !== quotaDomain(cell.provider))
 			throw new Error("invalid workflow quota domain");
-		return { batch: id, provider: cell.provider, suite: cell.suite };
+		return {
+			batch: id,
+			provider: cell.provider,
+			suite: cell.provider === "microsandbox-cloud" ? "all" : cell.suite,
+		};
 	});
 }

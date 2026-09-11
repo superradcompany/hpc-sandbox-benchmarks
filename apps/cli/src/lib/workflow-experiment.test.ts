@@ -40,3 +40,27 @@ test("large account cohorts partition into bounded collection rounds", () => {
 	expect(plan.rounds.map((round) => round.batches.length)).toEqual([64, 64, 64, 64, 1]);
 	expect(plan.cells.at(-1)?.replicate).toBe(256);
 });
+
+test("all Microsandbox suites run in one concurrent batch regardless of the old cap", () => {
+	const plan = workflowExperiment(
+		{
+			...env,
+			BENCH_PROVIDERS: "microsandbox-cloud",
+			BENCH_SUITES: "",
+			BENCH_PTS_PASSES: "2",
+			BENCH_ACCOUNT_CAPACITY: JSON.stringify({
+				"microsandbox-cloud": { sandboxes: 12, vcpus: 48, memoryGb: 96 },
+			}),
+		},
+		"2026-09-11",
+	);
+	expect(plan.cells).toHaveLength(54);
+	expect(new Set(plan.cells.map((cell) => cell.suite)).size).toBe(9);
+	expect(plan.batches).toHaveLength(1);
+	expect(plan.batches[0]?.cells).toHaveLength(54);
+	expect(plan.batches[0]?.maxConcurrency).toBe(54);
+	expect(plan.accounts).toEqual([{ quotaDomain: "microsandbox-cloud", sandboxes: 54 }]);
+	expect(workflowAxes(plan, "microsandbox-cloud", plan.rounds[0]?.id)).toEqual([
+		{ batch: plan.batches[0]?.id, provider: "microsandbox-cloud", suite: "all" },
+	]);
+});
