@@ -14,7 +14,7 @@ import type {
 	DriverOperationOptions,
 	ExecOptions,
 } from "@sandbox-benchmarks/driver";
-import { shellQuote } from "@sandbox-benchmarks/driver";
+import { detachedShellCommand, shellQuote } from "@sandbox-benchmarks/driver";
 import type {
 	ComputeSdkCreatedRequestVerification,
 	ComputeSdkDriverSpec,
@@ -240,7 +240,10 @@ export function microsandboxCompute(backend: DefaultBackend) {
 						staleAfterCommand = false;
 					}
 					try {
-						return await execShell(connected, command);
+						return await execShell(
+							connected,
+							options?.background ? detachedShellCommand(command) : command,
+						);
 					} catch (error) {
 						if (isConnectionError(error)) staleAfterCommand = true;
 						throw error;
