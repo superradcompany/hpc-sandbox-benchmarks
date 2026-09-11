@@ -135,7 +135,8 @@ RUN DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" \
 RUN MISE_VERSION="${MISE_VERSION}" MISE_SHA256_X64="${MISE_SHA256_X64}" MISE_SHA256_ARM64="${MISE_SHA256_ARM64}" \
     bash /tmp/build/scripts/orchestrator.sh 05-mise-binary.sh
 # hadolint ignore=DL3059
-RUN bash /tmp/build/scripts/orchestrator.sh 10-mise.sh
+RUN --mount=type=secret,id=github_token,env=MISE_GITHUB_TOKEN \
+    bash /tmp/build/scripts/orchestrator.sh 10-mise.sh
 # > PTS runtime + batch state; the profiles follow, one group per layer.
 # hadolint ignore=DL3059
 RUN DEBIAN_FRONTEND="${DEBIAN_FRONTEND}" \

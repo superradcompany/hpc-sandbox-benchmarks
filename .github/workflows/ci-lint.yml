@@ -31,10 +31,9 @@ permissions:
 jobs:
   actionlint:
     name: Lint workflows (actionlint)
-    runs-on: starsling-ubuntu-24.04-2
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # The runner is self-hosted, so never execute untrusted fork-PR code on it: run only for pushes
-    # and pull requests whose head is this same repository (fork PRs are skipped).
+    # Retain the existing same-repository PR policy while using disposable hosted runners.
     if: >-
       github.event_name == 'push' ||
       github.event.pull_request.head.repo.full_name == github.repository
@@ -68,7 +67,7 @@ jobs:
 
   zizmor:
     name: Audit workflows (zizmor)
-    runs-on: starsling-ubuntu-24.04-2
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: >-
       github.event_name == 'push' ||

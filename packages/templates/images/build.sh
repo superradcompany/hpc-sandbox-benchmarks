@@ -63,8 +63,14 @@ bun "${PINS_TS}" --mise-toml > "${HERE}/base/mise.toml"
 bun "${PINS_TS}" --e2b-toml > "${HERE}/e2b/e2b.toml"
 bun "${HERE}/../src/manifest.ts" > "${HERE}/base/toolchain-manifest.json"
 
+# Authenticate downloads without storing the token in an image layer.
+secret_args=()
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+	secret_args+=(--secret "id=github_token,env=GITHUB_TOKEN")
+fi
+
 echo ">>> building base: ${base_dev_tag} (+ ${base_ref})"
-docker build "${base_build_args[@]}" "${meta_args[@]}" \
+docker build "${base_build_args[@]}" "${meta_args[@]}" "${secret_args[@]}" \
 	-t "${base_dev_tag}" -t "${base_ref}" \
 	"${HERE}/base"
 
