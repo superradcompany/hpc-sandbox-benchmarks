@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { SandboxDriver } from "@sandbox-benchmarks/driver";
 import type { AccountRecord } from "./account-journal.ts";
-import { recoverAccount } from "./account-journal.ts";
+import { accountRecordSchema, recoverAccount } from "./account-journal.ts";
 
 const intent = {
 	version: "1",
@@ -52,6 +52,30 @@ test("an empty inventory cannot resolve an interrupted create without identity",
 		recoverAccount("tama", new Map([["tama", driver]]), journal, AbortSignal.timeout(1000)),
 	).rejects.toThrow("vendor-confirmed recovery required");
 	expect(events).toEqual([]);
+});
+
+test("operator-confirmed empty inventory resolves an unknown create without claiming it never allocated", async () => {
+	const release = accountRecordSchema.assert({
+		...intent,
+		kind: "released",
+		outcome: "verified-empty",
+		confirmedAt: "2026-09-11T21:00:00.000Z",
+		evidence:
+			"Operator confirmed the cancelled run's benchmark sandboxes were stopped and inventory was empty.",
+	});
+	const { driver, journal, events } = fixture([intent, release]);
+	await recoverAccount("tama", new Map([["tama", driver]]), journal, AbortSignal.timeout(1000));
+	expect(events).toEqual([]);
+	await expect(
+		recoverAccount(
+			"tama",
+			new Map([["tama", driver]]),
+			fixture([intent, { ...intent, kind: "allocated", ref }, release]).journal,
+			AbortSignal.timeout(1000),
+		),
+	).rejects.toThrow("contradicts");
+	expect(() => accountRecordSchema.assert({ ...release, evidence: "" })).toThrow();
+	expect(() => accountRecordSchema.assert({ ...release, confirmedAt: "not-a-date" })).toThrow();
 });
 test("conflicting release and allocation evidence blocks admission", async () => {
 	const { driver, journal } = fixture([

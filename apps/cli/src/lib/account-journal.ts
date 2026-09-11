@@ -18,6 +18,13 @@ export const accountRecordSchema = type.or(
 		"reject",
 	),
 	type({ ...base, kind: "'released'", outcome: "'not-allocated'" }).onUndeclaredKey("reject"),
+	type({
+		...base,
+		kind: "'released'",
+		outcome: "'verified-empty'",
+		confirmedAt: "string.date.iso",
+		evidence: "string >= 1",
+	}).onUndeclaredKey("reject"),
 );
 export type AccountRecord = typeof accountRecordSchema.infer;
 export interface AccountJournal {
@@ -51,7 +58,7 @@ export async function recoverAccount(
 			throw new Error("incomplete account journal provenance");
 		if (released) {
 			if (
-				released.outcome === "not-allocated"
+				released.outcome === "not-allocated" || released.outcome === "verified-empty"
 					? allocated !== undefined
 					: !allocated ||
 						allocated.ref.provider !== released.ref.provider ||
