@@ -21,14 +21,15 @@ jobs:
           assert base.startswith('https://')
           if not base.endswith('/v1'): base += '/v1'
           def request(path, method='GET'):
-              req = urllib.request.Request(base + path, method=method, headers={'Authorization': 'Bearer '+os.environ['MSB_API_KEY']})
+              req = urllib.request.Request(base + path, method=method, headers={'Authorization': 'Bearer '+os.environ['MSB_API_KEY'], 'User-Agent': 'microsandbox-benchmark-cleanup', 'Accept': 'application/json'})
               try:
                   with urllib.request.urlopen(req, timeout=90) as r:
                       body = r.read()
                       return json.loads(body) if body else None
               except urllib.error.HTTPError as e:
                   if e.code == 404 and method == 'GET': return None
-                  raise RuntimeError(f'{method} {path}: HTTP {e.code}') from None
+                  detail = e.read(1000).decode(errors='replace').replace(os.environ['MSB_API_KEY'], '[redacted]')
+                  raise RuntimeError(f'{method} {path}: HTTP {e.code}: {detail}') from None
           def inventory():
               rows, cursor, seen = [], None, set()
               for _ in range(100):
