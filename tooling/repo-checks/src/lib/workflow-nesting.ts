@@ -1,264 +1,179 @@
-// Invariant 6: GitHub-native suite→provider nesting wiring for bench-matrix.yml + bench-suite.yml.
-// Kept out of workflow-sync.ts so credential/timeout gates and nesting gates don't grow as one file.
-import {
-	asRecord,
-	MATRIX_WORKFLOW,
-	RUN_STEP,
-	SUITE_JOB,
-	SUITE_WORKFLOW,
-	stepByName,
-} from "./workflow-yaml.ts";
+/* biome-ignore-all lint/suspicious/noTemplateCurlyInString: GitHub expression contract literals */
+// Check the production account → round → bounded batch dispatch graph.
+import { asRecord, RUN_STEP, SUITE_WORKFLOW, stepByName } from "./workflow-yaml.ts";
 
-/** A bench-matrix suite job is one that `uses` this reusable workflow (matched by path suffix). */
-const SUITE_WORKFLOW_USES_SUFFIX = "/bench-suite.yml";
-
-/**
- * The single bench-matrix suite-matrix caller: the job that `uses` the reusable bench-suite.yml and
- * expands `strategy.matrix.suite` from the plan's suite axis. Native nesting depends on
- * `name` / `with.suite` both resolving to `matrix.suite`.
- */
-export interface SuiteMatrixCaller {
-	jobId: string;
-	name: string;
-	suiteInput: string;
-	/** The `with.replicates` expression — this suite's slice of the plan's per-suite map. */
-	replicatesInput: string;
-	matrixSuiteExpr: string;
-	/** Job ids listed in `publish.needs` (empty when publish is missing or has no needs list). */
-	publishNeeds: string[];
+const CELL_DRIVER_BIN = "bench-suite.ts";
+function jobEnvKeys(job: Record<string, unknown>, label: string): string[] {
+	const keys: string[] = [];
+	const collect = (value: unknown): void => {
+		if (value === undefined || value === null) return;
+		keys.push(...Object.keys(asRecord(value, `${label}: env is not a mapping`)));
+	};
+	collect(job.env);
+	if (Array.isArray(job.steps)) {
+		for (const rawStep of job.steps) collect(asRecord(rawStep, `${label}: malformed step`).env);
+	}
+	return keys;
 }
 
-/** The expression the suite-matrix job must use for its suite axis (plan output → fromJSON). */
-// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal matched verbatim against the workflow, not a JS template.
-export const EXPECTED_SUITE_MATRIX_EXPR = "${{ fromJSON(needs.plan.outputs.suites) }}";
-/** The expression that makes each caller cell's display name the suite id (native nesting parent). */
-// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal matched verbatim against the workflow, not a JS template.
-export const EXPECTED_SUITE_NAME_EXPR = "${{ matrix.suite }}";
-/** The expression that makes each reusable fan-out cell's display name the provider id (the nesting
- *  child): "<suite> / <provider>". There is no replicate suffix — one cell owns all R replicate
- *  sandboxes of its (suite, provider), driven concurrently from the single runner. */
-// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal matched verbatim against the workflow, not a JS template.
-export const EXPECTED_PROVIDER_NAME_EXPR = "${{ matrix.provider }}";
-
-/** The run-step env key that hands the cell its replicate index array. */
-export const REPLICATES_ENV_KEY = "BENCH_REPLICATES";
-/** The expression that key must carry: the reusable's own `replicates` input, verbatim. */
-// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal matched verbatim against the workflow, not a JS template.
-export const EXPECTED_REPLICATES_ENV_EXPR = "${{ inputs.replicates }}";
-/** The argument the run step must pass, so the env value is actually CONSUMED. Setting the env
- *  without passing the flag leaves bench-suite on its single-sandbox default — a green matrix run
- *  publishing R=1 — which is precisely what this invariant exists to prevent. */
-export const EXPECTED_REPLICATES_ARG = `--replicates "$${REPLICATES_ENV_KEY}"`;
-/** The expression the suite-matrix caller must hand down as `with.replicates`: this suite's slice of
- *  the plan's per-suite map. Pinned because a hardcoded array here (`'[0]'`) would pass every other
- *  nesting check while quietly running one sandbox per cell — the same R=1 outcome the callee-side
- *  checks guard, entered from the caller instead. */
-export const EXPECTED_REPLICATES_INPUT_EXPR =
-	// biome-ignore lint/suspicious/noTemplateCurlyInString: a GHA expression literal matched verbatim against the workflow, not a JS template.
-	"${{ toJSON(fromJSON(needs.plan.outputs.replicates)[matrix.suite]) }}";
-
 /**
- * The bench-matrix suite-matrix caller — exactly one job whose `uses` targets the reusable
- * bench-suite.yml, with its nesting wiring extracted. Zero or multiple callers throw (Invariant 6
- * must fail loudly, not pick one). Jobs that don't call the reusable (plan, publish) are ignored
- * except that `publish.needs` is captured for the dependency check.
+ * Invariant 3b (the consolidation invariant): a dispatch lane owns no benchmark cell of its own — it
+ * reaches sandboxes only through the reusable bench-suite.yml.
+ *
+ * bench-smoke.yml used to carry a hand-mirrored copy of the cell: its own checkout, its own Namespace
+ * mint, its own per-provider credential block, its own timeout and its own upload. Keeping that copy
+ * honest took a cross-lane credential gate (Invariant 4) and still let everything the gate did not
+ * compare — the runner routing, the cell budget, the shard-gated upload, the replicate fan-out — drift
+ * silently, so a smoke run could pass while exercising a different pipeline than the one it was meant
+ * to rehearse. Now both lanes call the reusable, and this rejects the ways back in.
+ *
+ * THREE probes, because one is not enough. Matching {@link RUN_STEP} by name alone catches the literal
+ * copy-paste and nothing else: a re-grown cell under a fresh step name, or provider credentials hung
+ * off a job-level `env:`, would both sail through — and those are the shapes someone re-adding a cell
+ * by hand actually writes. So also reject a `run:` that invokes the cell driver, and any provider
+ * credential appearing anywhere in a lane's env at all. `credentialKeys` is passed in (rather than
+ * imported) to keep this module free of the schema dependency; runCheck hands it the registry's
+ * requiredEnvVars, so the probe widens automatically when a provider is added.
  */
-export function matrixSuiteCaller(
+export function checkLaneDelegates(
 	doc: unknown,
-	label: string = MATRIX_WORKFLOW,
-): SuiteMatrixCaller {
+	label: string,
+	credentialKeys: Iterable<string>,
+): string[] {
 	const root = asRecord(doc, `${label}: not a YAML mapping`);
 	const jobs = asRecord(root.jobs, `${label}: no jobs mapping`);
-	const callers: Array<Omit<SuiteMatrixCaller, "publishNeeds">> = [];
+	const credentials = new Set(credentialKeys);
+	const errors: string[] = [];
+	const cell =
+		`the benchmark cell (credentials, runner routing, cell budget, replicate fan-out, artifact ` +
+		`upload) must live only in ${SUITE_WORKFLOW}, which both dispatch lanes call; a second copy is ` +
+		`exactly the drift this consolidation removed`;
 	for (const [jobId, rawJob] of Object.entries(jobs)) {
 		const job = asRecord(rawJob, `${label}: job "${jobId}" is not a mapping`);
-		const uses = job.uses;
-		if (typeof uses !== "string" || !uses.endsWith(SUITE_WORKFLOW_USES_SUFFIX)) continue;
-		const withMap = asRecord(
-			job.with,
-			`${label}: job "${jobId}" calls ${uses} without a "with" mapping`,
-		);
-		const suiteInput = withMap.suite;
-		if (typeof suiteInput !== "string") {
-			throw new Error(`${label}: job "${jobId}" calls ${uses} without a string "suite" input`);
+		if (stepByName(job, RUN_STEP, label) !== undefined) {
+			errors.push(`${label}: job "${jobId}" declares a "${RUN_STEP}" step — ${cell}`);
 		}
-		const replicatesInput = withMap.replicates;
-		if (typeof replicatesInput !== "string") {
-			throw new Error(`${label}: job "${jobId}" calls ${uses} without a string "replicates" input`);
+		const steps = Array.isArray(job.steps) ? job.steps : [];
+		for (const rawStep of steps) {
+			const step = asRecord(rawStep, `${label}: malformed step`);
+			if (
+				typeof step.run === "string" &&
+				(step.run.includes(CELL_DRIVER_BIN) || step.run.includes("workflow-experiment.ts execute"))
+			) {
+				errors.push(
+					`${label}: job "${jobId}" has a step whose run: invokes ${CELL_DRIVER_BIN} — ${cell}`,
+				);
+			}
 		}
-		const name = typeof job.name === "string" ? job.name : "";
-		const strategy = asRecord(
-			job.strategy,
-			`${label}: job "${jobId}" calls ${uses} without a "strategy" mapping`,
-		);
-		const matrix = asRecord(
-			strategy.matrix,
-			`${label}: job "${jobId}" calls ${uses} without a "strategy.matrix" mapping`,
-		);
-		const matrixSuiteExpr = matrix.suite;
-		if (typeof matrixSuiteExpr !== "string") {
-			throw new Error(
-				`${label}: job "${jobId}" calls ${uses} without a string "strategy.matrix.suite" axis`,
+		const leaked = [...new Set(jobEnvKeys(job, label))].filter((k) => credentials.has(k)).sort();
+		if (leaked.length > 0) {
+			errors.push(
+				`${label}: job "${jobId}" puts provider credential(s) ${leaked.join(", ")} in its env — ` +
+					`${cell}. A lane never needs a provider secret: it passes none down, and the cell resolves ` +
+					`its own from Environment "privileged"`,
 			);
 		}
-		callers.push({ jobId, name, suiteInput, replicatesInput, matrixSuiteExpr });
-	}
-	if (callers.length === 0) {
-		throw new Error(
-			`${label}: no job calls the reusable bench-suite.yml — the suite-matrix caller is missing`,
-		);
-	}
-	if (callers.length > 1) {
-		throw new Error(
-			`${label}: expected exactly one suite-matrix caller of bench-suite.yml, found ` +
-				`${callers.length} (${callers.map((c) => c.jobId).join(", ")})`,
-		);
-	}
-	// biome-ignore lint/style/noNonNullAssertion: length checked above.
-	const caller = callers[0]!;
-	const publish = jobs.publish;
-	let publishNeeds: string[] = [];
-	if (publish !== undefined) {
-		const publishJob = asRecord(publish, `${label}: job "publish" is not a mapping`);
-		const needs = publishJob.needs;
-		if (Array.isArray(needs)) {
-			publishNeeds = needs.map((n) => String(n));
-		} else if (typeof needs === "string") {
-			publishNeeds = [needs];
-		}
-	}
-	return { ...caller, publishNeeds };
-}
-
-/**
- * Invariant 6: the bench-matrix suite-matrix caller is wired for GitHub-native nesting and depends on
- * the plan's suite axis — display name and `with.suite` are `${{ matrix.suite }}`, the matrix axis is
- * `fromJSON(needs.plan.outputs.suites)`, and `publish` needs the caller job. `label` names the
- * workflow in error messages.
- */
-export function checkSuiteMatrixCaller(
-	caller: SuiteMatrixCaller,
-	label: string = MATRIX_WORKFLOW,
-): string[] {
-	const errors: string[] = [];
-	if (caller.name !== EXPECTED_SUITE_NAME_EXPR) {
-		errors.push(
-			`${label}: job "${caller.jobId}" name must be "${EXPECTED_SUITE_NAME_EXPR}" for native ` +
-				`suite nesting in the Actions UI (got ${caller.name ? `"${caller.name}"` : "no name"})`,
-		);
-	}
-	if (caller.suiteInput !== EXPECTED_SUITE_NAME_EXPR) {
-		errors.push(
-			`${label}: job "${caller.jobId}" with.suite must be "${EXPECTED_SUITE_NAME_EXPR}" so each ` +
-				`matrix cell dispatches its own suite (got "${caller.suiteInput}")`,
-		);
-	}
-	if (caller.replicatesInput !== EXPECTED_REPLICATES_INPUT_EXPR) {
-		errors.push(
-			`${label}: job "${caller.jobId}" with.replicates must be "${EXPECTED_REPLICATES_INPUT_EXPR}" ` +
-				`so each cell receives its own suite's replicate axis from the plan — a literal or a ` +
-				`different suite's slice silently changes how many sandboxes the run measures ` +
-				`(got "${caller.replicatesInput}")`,
-		);
-	}
-	if (caller.matrixSuiteExpr !== EXPECTED_SUITE_MATRIX_EXPR) {
-		errors.push(
-			`${label}: job "${caller.jobId}" strategy.matrix.suite must be "${EXPECTED_SUITE_MATRIX_EXPR}" ` +
-				`so the suite axis stays registry-driven via plan.outputs.suites (got "${caller.matrixSuiteExpr}")`,
-		);
-	}
-	if (!caller.publishNeeds.includes(caller.jobId)) {
-		errors.push(
-			`${label}: job "publish" must need "${caller.jobId}" so aggregation waits for every suite ` +
-				`matrix cell (publish.needs=${JSON.stringify(caller.publishNeeds)})`,
-		);
 	}
 	return errors;
 }
 
-/**
- * Invariant 6 (callee half): the reusable bench-suite fan-out job display name is the provider id so
- * nested Actions UI cells read as "<suite> / <provider>", AND the replicate axis reaches the cell as
- * data rather than as a matrix axis.
- *
- * The replicate check is the load-bearing half. The `replicates` input used to be consumed by
- * `strategy.matrix.replicate`, so forgetting to wire it was impossible — the fan-out simply had no
- * cells. Now the array is handed to one cell through the run step's environment, and a dropped or
- * misspelled `BENCH_REPLICATES` would leave `bench-suite` on its single-sandbox default: a green
- * matrix run that quietly published R=1 for every provider, with the dataset's between-machine
- * intervals silently collapsing to within-machine ones. Assert both that the axis is gone from the
- * matrix (so R runners are not re-introduced by accident) and that the input reaches the cell.
- */
-export function checkSuiteWorkflowNesting(doc: unknown, label: string = SUITE_WORKFLOW): string[] {
-	const root = asRecord(doc, `${label}: not a YAML mapping`);
-	const jobs = asRecord(root.jobs, `${label}: no jobs mapping`);
-	const job = jobs[SUITE_JOB];
-	if (job === undefined) {
-		return [`${label}: job "${SUITE_JOB}" is missing — the provider fan-out job is required`];
-	}
-	const bench = asRecord(job, `${label}: job "${SUITE_JOB}" is not a mapping`);
+export function checkExperimentNesting(docs: Record<string, unknown>): string[] {
 	const errors: string[] = [];
-
-	const name = typeof bench.name === "string" ? bench.name : "";
-	if (name !== EXPECTED_PROVIDER_NAME_EXPR) {
-		errors.push(
-			`${label}: job "${SUITE_JOB}" name must be "${EXPECTED_PROVIDER_NAME_EXPR}" for native ` +
-				`provider nesting under each suite (got ${name ? `"${name}"` : "no name"})`,
+	const job = (file: string, name: string) =>
+		asRecord(asRecord(asRecord(docs[file], file).jobs, file)[name], `${file}:${name}`);
+	const expect = (condition: boolean, detail: string) => {
+		if (!condition) errors.push(detail);
+	};
+	for (const file of ["bench-matrix.yml", "bench-smoke.yml"]) {
+		const caller = job(file, "suite");
+		expect(
+			caller.uses === "./.github/workflows/bench-account.yml",
+			`${file}: must dispatch account workflow`,
+		);
+		const strategy = asRecord(caller.strategy, file);
+		expect(
+			asRecord(strategy.matrix, file).account === "${{ fromJSON(needs.plan.outputs.accounts) }}",
+			`${file}: account axis must come from frozen plan`,
+		);
+		const step = stepByName(job(file, "plan"), "Plan", file);
+		expect(
+			step?.run === "bun apps/cli/src/bin/workflow-experiment.ts plan",
+			`${file}: must freeze experiment before dispatch`,
+		);
+		const env = asRecord(step?.env, file);
+		expect(
+			env.BENCH_PROVIDERS ===
+				(file === "bench-matrix.yml" ? "${{ inputs.providers }}" : "${{ inputs.provider }}"),
+			`${file}: selected providers must enter plan`,
+		);
+		expect(
+			env.BENCH_SUITES ===
+				(file === "bench-matrix.yml" ? "${{ inputs.suites }}" : "${{ inputs.suite }}"),
+			`${file}: selected suites must enter plan`,
+		);
+		expect(
+			env.BENCH_REPLICAS ===
+				(file === "bench-matrix.yml" ? "${{ inputs.replicas }}" : "${{ inputs.replicas || '1' }}"),
+			`${file}: preserve replicate defaults`,
 		);
 	}
-
-	// A `replicate` matrix axis would restore one idle runner per replicate — the cost this fan-out
-	// was moved in-process to remove. `?? {}` reads an absent strategy/matrix as "no axis"; a present
-	// but malformed one still throws, matching how the rest of this module navigates.
-	const strategy = asRecord(
-		bench.strategy ?? {},
-		`${label}: job "${SUITE_JOB}" strategy is not a mapping`,
+	for (const [file, callee, axis] of [
+		["bench-account.yml", "bench-round.yml", "round"],
+		["bench-round.yml", "bench-suite.yml", "include"],
+	]) {
+		if (!file || !callee || !axis) continue;
+		const caller = job(file, "execute");
+		const strategy = asRecord(caller.strategy, file);
+		// Rounds run one at a time so a later round's approval gate is raised only once the previous
+		// round has finished; a round's batches are created together — no max-parallel, the account
+		// concurrency queue serialises them — so ONE `privileged` approval releases the whole round
+		// (GitHub approves only the jobs already pending). Neither level may cancel its peers.
+		if (axis === "round") {
+			expect(
+				strategy["max-parallel"] === 1 && strategy["fail-fast"] === false,
+				`${file}: rounds must run one at a time without cancelling peers`,
+			);
+		} else {
+			expect(
+				strategy["max-parallel"] === undefined && strategy["fail-fast"] === false,
+				`${file}: a round's batches must be created together (no max-parallel) without cancelling peers`,
+			);
+		}
+		expect(caller.uses === `./.github/workflows/${callee}`, `${file}: wrong execution delegate`);
+		expect(
+			asRecord(strategy.matrix, file)[axis] === "${{ fromJSON(needs.plan.outputs.axis) }}",
+			`${file}: axis must come from frozen plan`,
+		);
+	}
+	const worker = job("bench-suite.yml", "bench");
+	const step = stepByName(worker, RUN_STEP, "bench-suite.yml");
+	expect(
+		step?.run === "bun apps/cli/src/bin/workflow-experiment.ts execute",
+		"worker must use managed batch executor",
 	);
-	const matrix = asRecord(
-		strategy.matrix ?? {},
-		`${label}: job "${SUITE_JOB}" strategy.matrix is not a mapping`,
+	expect(
+		asRecord(step?.env, "worker").BENCH_BATCH_ID === "${{ inputs.batch_id }}",
+		"worker must bind batch identity",
 	);
-	if (matrix.replicate !== undefined) {
-		errors.push(
-			`${label}: job "${SUITE_JOB}" must not have a "replicate" matrix axis — the cell drives ` +
-				`every replicate itself (bench-suite --replicates), so an axis here bills one idle ` +
-				`runner per replicate for no extra throughput`,
-		);
-	}
-
-	// Both remaining checks read the SAME step, so locate it once. `?? {}` again: a missing step or
-	// env block is drift this gate reports, not a parse error — the two checks below name it.
-	const step = stepByName(bench, RUN_STEP, label);
-	const env = asRecord(
-		step?.env ?? {},
-		`${label}: job "${SUITE_JOB}" step "${RUN_STEP}" env is not a mapping`,
+	const publish = job("bench-matrix.yml", "publish");
+	expect(
+		Array.isArray(publish.needs) &&
+			publish.needs.includes("suite") &&
+			publish.needs.includes("plan"),
+		"publication must wait for plan and all account batches",
 	);
-
-	// ...the array must actually reach it, or the cell silently falls back to a single sandbox...
-	const rawEnv = env[REPLICATES_ENV_KEY];
-	const replicatesEnv = typeof rawEnv === "string" ? rawEnv : undefined;
-	if (replicatesEnv !== EXPECTED_REPLICATES_ENV_EXPR) {
-		errors.push(
-			`${label}: job "${SUITE_JOB}" step "${RUN_STEP}" must set ${REPLICATES_ENV_KEY}: ` +
-				`"${EXPECTED_REPLICATES_ENV_EXPR}" so the cell fans out over the plan's replicate axis ` +
-				`(got ${replicatesEnv === undefined ? "no such env key" : `"${replicatesEnv}"`})`,
-		);
-	}
-
-	// ...AND the command must consume it. Checking only the env block left the invariant bypassable by
-	// its own stated failure mode: dropping the flag from the `run:` line keeps the env key present, so
-	// the gate stayed green while bench-suite took its single-sandbox default and the legacy
-	// `<runId>.json` glob in commit-dataset.yml collected the lone shard without complaint — a matrix
-	// run that publishes R=1 with the dataset's between-machine intervals collapsed to within-machine
-	// ones. A substring match is enough and matches how the rest of this module pins expressions.
-	const runCommand = typeof step?.run === "string" ? step.run : undefined;
-	if (runCommand === undefined || !runCommand.includes(EXPECTED_REPLICATES_ARG)) {
-		errors.push(
-			`${label}: job "${SUITE_JOB}" step "${RUN_STEP}" must pass ${EXPECTED_REPLICATES_ARG} to ` +
-				`bench-suite — setting ${REPLICATES_ENV_KEY} without consuming it silently runs ONE sandbox ` +
-				`per cell (got ${runCommand === undefined ? "no run: command" : `"${runCommand.trim()}"`})`,
-		);
-	}
-
+	const promotion = stepByName(
+		job("commit-dataset.yml", "commit"),
+		"Aggregate + promote",
+		"commit-dataset.yml",
+	);
+	expect(
+		typeof promotion?.run === "string" &&
+			promotion.run.includes(
+				"aggregate-experiment.ts experiment/manifest/plan.json experiment/attempts",
+			) &&
+			promotion.run.includes("data/dataset experiment/manifest/plan.json experiment/attempts"),
+		"publication must verify original plan and whole attempts",
+	);
 	return errors;
 }

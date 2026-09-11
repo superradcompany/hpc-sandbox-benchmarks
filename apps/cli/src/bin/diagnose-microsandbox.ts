@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { mkdirSync, writeFileSync } from "node:fs";
 import { DIR, StepRunner, setupSteps } from "@sandbox-benchmarks/harness";
-import { createMicrosandboxCloudCompute, providers } from "@sandbox-benchmarks/providers";
+import { microsandboxCloudCompute, config as providerConfig } from "@sandbox-benchmarks/providers";
 import { SUITES } from "@sandbox-benchmarks/schema";
 import {
 	DIAGNOSTICS,
@@ -20,11 +20,22 @@ const name = diagnosticSandboxId(
 		? `bench-cloud-diag-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}`
 		: (process.env.DIAGNOSTIC_SANDBOX_ID ?? ""),
 );
-const provider = providers.find((p) => p.name === "microsandbox-cloud");
-if (!provider) throw new Error("Provider unavailable");
 const nofile = diagnosticNofile(config);
-const compute =
-	nofile === undefined ? provider.createCompute() : createMicrosandboxCloudCompute(nofile);
+const compute = microsandboxCloudCompute({
+	backend: {
+		kind: "cloud",
+		apiKey: process.env.MSB_API_KEY ?? "",
+		url: process.env.MSB_API_URL ?? "https://api.microsandbox.dev",
+	},
+	ephemeral: true,
+	image: providerConfig.toolchainImage,
+	cpus: 4,
+	memoryMib: 8192,
+	rootDiskMib: 40960,
+	namePrefix: "bench-cloud-",
+	timeoutMs: 120 * 60_000,
+	...(nofile === undefined ? {} : { nofile }),
+});
 const output = "diagnostic-results";
 mkdirSync(output, { recursive: true });
 const manifest = {
@@ -55,7 +66,6 @@ try {
 		}
 		try {
 			const sandbox = await compute.sandbox.create({
-				...provider.createOptions,
 				name,
 				timeout: 120 * 60_000,
 				metadata: { diagnostic: "v1", config },
@@ -83,7 +93,11 @@ try {
 			await sandbox.destroy();
 			save("cleaned-up");
 		} else {
-			const runner = new StepRunner(sandbox, provider.transport);
+			const runner = new StepRunner(sandbox, {
+				streaming: false,
+				syncCapMs: 60_000,
+				detachedPoll: true,
+			});
 			try {
 				for (const step of setupSteps({
 					...SUITES["realworld-mastra"],

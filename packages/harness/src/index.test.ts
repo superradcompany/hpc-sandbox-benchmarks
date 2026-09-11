@@ -1,13 +1,22 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DirectProvider, ProviderConfig } from "@sandbox-benchmarks/providers";
-import type { Suite } from "@sandbox-benchmarks/schema";
-import { parseGapMarker, sandboxFailureMarkerFile } from "@sandbox-benchmarks/schema";
+import { markRetryableCreate } from "@sandbox-benchmarks/providers";
+import type { ProviderCostEvidence, Suite } from "@sandbox-benchmarks/schema";
+import {
+	bakedArtifactName,
+	parseGapMarker,
+	parseProviderArtifactEvidence,
+	sandboxFailureMarkerFile,
+} from "@sandbox-benchmarks/schema";
+import type { SuiteRunContext } from "./index.ts";
 import {
 	benchmarkLifecycle,
+	benchmarkLifecycleCompute,
 	createSuiteSandbox,
+	createSuiteSandboxFromPlan,
 	hasRequiredCreds,
 	missingCreds,
 	requiredProviders,
@@ -22,6 +31,7 @@ import {
 import type { CommandResult, SandboxHandle } from "./lib/execute.ts";
 import type { LifecycleCompute } from "./lib/lifecycle.ts";
 import { READINESS_CMD } from "./lib/readiness.ts";
+import { cleanupOwnedSandboxes } from "./lib/sandbox-owner.ts";
 
 // A transport capability for the test fixtures — capped-with-detach, matching a single-round-trip
 // provider; none of these tests exercise real exec, so the exact values are inert here.
@@ -31,6 +41,7 @@ const fixtureTransport = { streaming: false, syncCapMs: 60_000, detachedPoll: tr
 // test free of any real SDK while staying fully typed.
 const config: ProviderConfig = {
 	name: "e2b",
+	artifact: { kind: "baked", ref: "test-template" },
 	requiredEnvVars: [],
 	transport: fixtureTransport,
 	createCompute: () => {
@@ -41,6 +52,7 @@ const config: ProviderConfig = {
 // A fake provider that records its lifecycle calls, so withSandbox can be exercised offline with no
 // real SDK. Only the methods withSandbox touches are implemented; the cast recovers the full type.
 function fakeProvider(calls: string[], opts: { destroyFails?: boolean } = {}): ProviderConfig {
+	let remainingDestroyFailures = opts.destroyFails ? 1 : 0;
 	const sandbox = {
 		sandboxId: "sb-1",
 		provider: "e2b",
@@ -50,7 +62,11 @@ function fakeProvider(calls: string[], opts: { destroyFails?: boolean } = {}): P
 		},
 		destroy: () => {
 			calls.push("destroy");
-			return opts.destroyFails ? Promise.reject(new Error("destroy failed")) : Promise.resolve();
+			if (remainingDestroyFailures > 0) {
+				remainingDestroyFailures--;
+				return Promise.reject(new Error("destroy failed"));
+			}
+			return Promise.resolve();
 		},
 	};
 	const compute = {
@@ -63,11 +79,16 @@ function fakeProvider(calls: string[], opts: { destroyFails?: boolean } = {}): P
 	} as unknown as DirectProvider;
 	return {
 		name: "e2b",
+		artifact: { kind: "baked", ref: "test-template" },
 		requiredEnvVars: [],
 		transport: fixtureTransport,
 		createCompute: () => compute,
 	};
 }
+
+afterEach(async () => {
+	expect(await cleanupOwnedSandboxes()).toEqual([]);
+});
 
 describe("@sandbox-benchmarks/harness", () => {
 	it("times an operation and emits a raw run for the provider", async () => {
@@ -124,6 +145,7 @@ describe("@sandbox-benchmarks/harness", () => {
 	// modal-named config.
 	const credsCfg: ProviderConfig = {
 		name: "modal-gvisor",
+		artifact: { kind: "image", ref: "test-image" },
 		requiredEnvVars: ["A", "B"],
 		transport: { streaming: false, syncCapMs: null, detachedPoll: true },
 		createCompute: () => {
@@ -190,6 +212,7 @@ describe("@sandbox-benchmarks/harness", () => {
 		}
 		return {
 			name: "e2b",
+			artifact: { kind: "baked", ref: "test-template" },
 			requiredEnvVars: [],
 			transport: fixtureTransport,
 			createCompute: () => compute as unknown as DirectProvider,
@@ -242,6 +265,26 @@ describe("@sandbox-benchmarks/harness", () => {
 		const spawnGap = result.gaps.find((g) => g.id === "lifecycle_spawn_ms");
 		expect(spawnGap?.reason).toBe("spawn boom");
 		expect(spawnGap?.outcome).toBe("failed");
+	});
+
+	it("benchmarkLifecycle skips control-plane info when the sandbox exposes no getInfo", async () => {
+		const compute: LifecycleCompute = {
+			sandbox: {
+				create: async () => ({
+					sandboxId: "sb-1",
+					runCommand: async () => ({ exitCode: 0 }),
+					destroy: async () => undefined,
+				}),
+			},
+		};
+		const result = await benchmarkLifecycleCompute("e2b", compute, { iterations: 2 });
+		const infoSkips = result.gaps.filter((g) => g.id === "control_plane_info_ms");
+		expect(infoSkips).toHaveLength(1);
+		expect(infoSkips[0]?.outcome).toBe("skipped");
+		expect(infoSkips[0]?.reason).toMatch(/no sandbox info/);
+		expect(result.aggregates.find((a) => a.metricId === "lifecycle_spawn_ms")?.aggregates.n).toBe(
+			2,
+		);
 	});
 
 	it("benchmarkLifecycle clamps a non-finite iterations to a single cycle", async () => {
@@ -306,6 +349,8 @@ function makeSandbox(opts: {
 	benchmarkFails?: boolean;
 	collectFails?: boolean;
 	collectFiles?: Record<string, string>;
+	/** Contents returned for the release-owned manifest probe. */
+	manifest?: string;
 	/** Never answer the readiness probe — a sandbox whose image never finishes pulling. */
 	neverReady?: boolean;
 	placementFails?: boolean;
@@ -321,6 +366,11 @@ function makeSandbox(opts: {
 				? { exitCode: 124, stderr: "placement deadline" }
 				: { exitCode: 0 };
 
+		if (command.includes("/toolchain-manifest.json")) {
+			return opts.manifest === undefined
+				? { exitCode: 1, stderr: "manifest missing" }
+				: { exitCode: 0, stdout: opts.manifest };
+		}
 		if (command.includes("df -Pk")) return { exitCode: 0, stdout: opts.freeKb ?? "999999999" };
 		if (command.includes("base64")) {
 			if (opts.collectFails) return { exitCode: 1, stderr: "collect boom" };
@@ -333,8 +383,9 @@ function makeSandbox(opts: {
 		return { exitCode: 0, stdout: "" };
 	};
 	const tagOf = (command: string, ext: string): string | undefined =>
-		command.match(new RegExp(`/tmp/(bench-[0-9a-f-]+)\\.${ext}`))?.[1];
+		command.match(new RegExp(`/tmp/(bench-[0-9a-f-]+)/(?:output|completion)\\.${ext}`))?.[1];
 	return {
+		sandboxId: "sb-test-1",
 		async runCommand(command) {
 			// Readiness probe: issued raw (not through StepRunner), so it arrives unwrapped by the preamble.
 			if (command === READINESS_CMD) return { exitCode: opts.neverReady ? 1 : 0 };
@@ -352,7 +403,7 @@ function makeSandbox(opts: {
 			const doneTag = tagOf(command, "done");
 			if (doneTag) {
 				const d = detached.get(doneTag);
-				return { exitCode: 0, stdout: d ? String(d.exit) : "__RUNNING__" };
+				return { exitCode: 0, stdout: d ? `v1 ${doneTag} ${d.exit}` : "__RUNNING__" };
 			}
 			// Cat-read of the log: the stashed output (stderr merged into stdout, mirroring live 2>&1).
 			const logTag = tagOf(command, "log");
@@ -378,7 +429,9 @@ const suite = (overrides: Partial<Suite>): Suite => ({
 	...overrides,
 });
 
-const ctx = (s: Suite, resultsDir: string) => ({
+const ctx = (s: Suite, resultsDir: string): SuiteRunContext => ({
+	runId: "run-test-1",
+	artifact: { kind: "baked", ref: "test-template" },
 	suite: s,
 	suiteName: "cpu-node",
 	providerName: "daytona-vm",
@@ -391,32 +444,57 @@ const ctx = (s: Suite, resultsDir: string) => ({
 describe("runSuite (resolution + credential gate)", () => {
 	it("rejects an unknown suite as a usage error", async () => {
 		await expect(
-			runSuite({ providerName: "daytona-vm", suiteName: "nope", resultsDir: freshDir() }),
+			runSuite({
+				runId: "test",
+				providerName: "daytona-vm",
+				suiteName: "nope",
+				resultsDir: freshDir(),
+			}),
 		).rejects.toBeInstanceOf(SuiteUsageError);
 	});
 
 	it("rejects an unknown provider as a usage error", async () => {
 		await expect(
-			runSuite({ providerName: "nope", suiteName: "cpu-node", resultsDir: freshDir() }),
+			runSuite({
+				runId: "test",
+				providerName: "nope",
+				suiteName: "cpu-node",
+				resultsDir: freshDir(),
+			}),
 		).rejects.toBeInstanceOf(SuiteUsageError);
 	});
 
-	it("records a skip marker (not a failure) when credentials are missing", async () => {
-		const resultsDir = freshDir();
-		// Empty env → daytona's required key is absent, so the suite skips before any sandbox is created.
-		await runSuite({ providerName: "daytona-vm", suiteName: "cpu-node", resultsDir, env: {} });
-		expect(existsSync(join(resultsDir, "sandbox-daytona-vm-cpu-node--skipped.json"))).toBe(true);
+	it("rejects migrated providers on the retired legacy entry point", async () => {
+		await expect(
+			runSuite({
+				runId: "test",
+				providerName: "namespace",
+				suiteName: "cpu-node",
+				resultsDir: freshDir(),
+				env: {},
+			}),
+		).rejects.toBeInstanceOf(SuiteUsageError);
 	});
 });
 
 describe("createSuiteSandbox (creation-failure marker)", () => {
 	// The daytona-container incident shape: creation itself throws, so no sandbox — and no result —
 	// ever exists for the cell. The marker is the shard's ONLY record of the failure.
-	const createCtx = (resultsDir: string, overrides: { createTimeoutMs?: number } = {}) => ({
+	const createCtx = (
+		resultsDir: string,
+		overrides: {
+			createTimeoutMs?: number | null;
+			createAttemptCeilingMs?: number;
+			retryDelayMs?: number;
+			retryBudgetMs?: number;
+			sleep?: (ms: number) => Promise<void>;
+		} = {},
+	) => ({
 		suite: suite({}),
 		suiteName: "cpu-node",
 		providerName: "daytona-container",
 		resultsDir,
+		retryBudgetMs: 60 * 60_000,
 		...overrides,
 	});
 	const MARKER = "sandbox-daytona-container-cpu-node--failed.json";
@@ -454,6 +532,201 @@ describe("createSuiteSandbox (creation-failure marker)", () => {
 				detail: "Snapshot toolchain-v3-container is not available",
 			},
 		});
+	});
+
+	it("retries a create the adapter marked retryable, then returns the sandbox", async () => {
+		const resultsDir = freshDir();
+		const handle = makeSandbox({ destroyed: { hit: false } });
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					// A stalled control plane: the message names no quota, rate limit or 429, so only the
+					// adapter's explicit mark can keep this cell alive.
+					if (attempts < 3) {
+						throw markRetryableCreate(new Error("run.cloud create did not settle within 30000ms"));
+					}
+					return handle;
+				},
+			},
+		};
+		await expect(
+			createSuiteSandbox(() => compute, createCtx(resultsDir, { retryDelayMs: 1 })),
+		).resolves.toBe(handle);
+		expect(attempts).toBe(3);
+		// The cell recovered, so nothing failed and no marker belongs in the shard.
+		expect(existsSync(join(resultsDir, MARKER))).toBe(false);
+	});
+
+	it("does not retry an unmarked create failure whose message names no capacity limit", async () => {
+		const resultsDir = freshDir();
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					// Same sentence, no mark: the adapter never established that nothing was allocated, so
+					// re-issuing could stack allocations it cannot see.
+					throw new Error("run.cloud create did not settle within 30000ms");
+				},
+			},
+		};
+		await expect(
+			createSuiteSandbox(() => compute, createCtx(resultsDir, { retryDelayMs: 1 })),
+		).rejects.toThrow("did not settle");
+		expect(attempts).toBe(1);
+		expect(existsSync(join(resultsDir, MARKER))).toBe(true);
+	});
+
+	it("still retries on the message match, for adapters that do not set the mark", async () => {
+		const resultsDir = freshDir();
+		const handle = makeSandbox({ destroyed: { hit: false } });
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					if (attempts < 2) throw new Error("429 Too Many Requests");
+					return handle;
+				},
+			},
+		};
+		await expect(
+			createSuiteSandbox(() => compute, createCtx(resultsDir, { retryDelayMs: 1 })),
+		).resolves.toBe(handle);
+		expect(attempts).toBe(2);
+	});
+
+	it("does not leak the legacy message matcher into an explicit create plan", async () => {
+		const resultsDir = freshDir();
+		let attempts = 0;
+		await expect(
+			createSuiteSandboxFromPlan(
+				{
+					create: async () => {
+						attempts++;
+						throw new Error("429 Too Many Requests");
+					},
+					isRetryable: () => false,
+				},
+				createCtx(resultsDir, { retryDelayMs: 1 }),
+			),
+		).rejects.toThrow("429 Too Many Requests");
+		expect(attempts).toBe(1);
+		expect(existsSync(join(resultsDir, MARKER))).toBe(true);
+	});
+
+	it.each([
+		0,
+		undefined,
+	])("writes a FAILED marker without a positive retry budget (%s)", async (retryBudgetMs) => {
+		const resultsDir = freshDir();
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					throw markRetryableCreate(new Error("no slot right now"));
+				},
+			},
+		};
+		// A budget smaller than one delay leaves no room for another attempt, so the first failure is
+		// also the last: patience is bounded, and the cell still records why it produced nothing.
+		await expect(
+			createSuiteSandbox(() => compute, createCtx(resultsDir, { retryDelayMs: 50, retryBudgetMs })),
+		).rejects.toThrow("no slot right now");
+		expect(attempts).toBe(1);
+		expect(JSON.parse(readFileSync(join(resultsDir, MARKER), "utf8")).outcome).toBe("failed");
+	});
+
+	it("stops when the budget can cover the backoff but not another adapter-bounded attempt", async () => {
+		const resultsDir = freshDir();
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					throw markRetryableCreate(new Error("create did not settle"));
+				},
+			},
+		};
+		// The run.cloud shape: the harness race is off, so an attempt is bounded only by the ceiling the
+		// adapter declares. Room for the 10ms backoff but not the 5s attempt behind it — starting one
+		// would put the failure marker (and the matrix cell) seconds past the budget it promised.
+		await expect(
+			createSuiteSandbox(
+				() => compute,
+				createCtx(resultsDir, {
+					createTimeoutMs: null,
+					createAttemptCeilingMs: 5_000,
+					retryDelayMs: 10,
+					retryBudgetMs: 1_000,
+				}),
+			),
+		).rejects.toThrow("create did not settle");
+		expect(attempts).toBe(1);
+		expect(JSON.parse(readFileSync(join(resultsDir, MARKER), "utf8")).outcome).toBe("failed");
+	});
+
+	it("re-checks the budget after a backoff timer that fires late", async () => {
+		const resultsDir = freshDir();
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					throw markRetryableCreate(new Error("create did not settle"));
+				},
+			},
+		};
+		// setTimeout promises a floor, not a ceiling: a loaded runner can return from the backoff long
+		// after it was asked to. The pre-sleep reservation was arithmetic on a clock reading that is now
+		// stale, so without the recheck this late sleep would start an attempt the budget cannot cover.
+		await expect(
+			createSuiteSandbox(
+				() => compute,
+				createCtx(resultsDir, {
+					createTimeoutMs: null,
+					createAttemptCeilingMs: 10,
+					retryDelayMs: 1,
+					retryBudgetMs: 40,
+					sleep: () => new Promise((r) => setTimeout(r, 60)),
+				}),
+			),
+		).rejects.toThrow("create did not settle");
+		expect(attempts).toBe(1);
+		expect(JSON.parse(readFileSync(join(resultsDir, MARKER), "utf8")).outcome).toBe("failed");
+	});
+
+	it("keeps retrying while the budget still covers the backoff and one whole attempt", async () => {
+		const resultsDir = freshDir();
+		const handle = makeSandbox({ destroyed: { hit: false } });
+		let attempts = 0;
+		const compute = {
+			sandbox: {
+				create: async (): Promise<SandboxHandle> => {
+					attempts++;
+					if (attempts < 2) throw markRetryableCreate(new Error("create did not settle"));
+					return handle;
+				},
+			},
+		};
+		// Same shape, ample budget: reserving one attempt's worth must not collapse the retry loop into
+		// a single try for the adapters that need it most.
+		await expect(
+			createSuiteSandbox(
+				() => compute,
+				createCtx(resultsDir, {
+					createTimeoutMs: null,
+					createAttemptCeilingMs: 5_000,
+					retryDelayMs: 1,
+					retryBudgetMs: 60_000,
+				}),
+			),
+		).resolves.toBe(handle);
+		expect(attempts).toBe(2);
+		expect(existsSync(join(resultsDir, MARKER))).toBe(false);
 	});
 
 	it("writes a FAILED marker when adapter construction (the factory) throws before create", async () => {
@@ -498,6 +771,22 @@ describe("createSuiteSandbox (creation-failure marker)", () => {
 		// Let the late create settle and the attached cleanup run.
 		await new Promise((r) => setTimeout(r, 60));
 		expect(destroyed.hit).toBe(true);
+	});
+
+	it("does not abandon an adapter-owned create/cleanup promise when its timeout is disabled", async () => {
+		const resultsDir = freshDir();
+		const handle = makeSandbox({ destroyed: { hit: false } });
+		const compute = {
+			sandbox: {
+				create: (): Promise<SandboxHandle> =>
+					new Promise((resolve) => setTimeout(() => resolve(handle), 30)),
+			},
+		};
+
+		await expect(
+			createSuiteSandbox(() => compute, createCtx(resultsDir, { createTimeoutMs: null })),
+		).resolves.toBe(handle);
+		expect(existsSync(join(resultsDir, MARKER))).toBe(false);
 	});
 
 	it("folds into a suite-scope FAILED gap through the extractor's marker reader", async () => {
@@ -584,6 +873,299 @@ describe("runSuiteOnSandbox (orchestration + teardown)", () => {
 		expect(destroyed.hit).toBe(true);
 	});
 
+	it("persists the honest requested-artifact fallback before touching the sandbox", async () => {
+		const resultsDir = freshDir();
+		const destroyed = { hit: false };
+		await expect(
+			runSuiteOnSandbox(makeSandbox({ destroyed, neverReady: true }), {
+				...ctx(suite({}), resultsDir),
+				readiness: {
+					maxAttempts: 1,
+					retryDelayMs: 0,
+					probeTimeoutMs: 5,
+					delay: () => Promise.resolve(),
+				},
+			}),
+		).rejects.toThrow(/never ready/);
+		const evidence = parseProviderArtifactEvidence(
+			readFileSync(join(resultsDir, "provider-artifact-evidence.json"), "utf8"),
+		);
+		expect(evidence).toEqual({
+			cell: { runId: "run-test-1", providerId: "daytona-vm", suite: "cpu-node" },
+			sandboxId: "sb-test-1",
+			provenance: {
+				source: "request-fallback",
+				requested: { kind: "baked", ref: "test-template" },
+			},
+		});
+		expect(destroyed.hit).toBe(true);
+	});
+
+	it("upgrades a canonical release artifact only after the guest manifest matches", async () => {
+		const resultsDir = freshDir();
+		const artifact = { kind: "baked", ref: bakedArtifactName("daytona-vm", "version") } as const;
+		await runSuiteOnSandbox(
+			makeSandbox({
+				destroyed: { hit: false },
+				manifest: JSON.stringify({
+					image_name: "sandbox-benchmarks-toolchain",
+					image_version: "v8",
+				}),
+			}),
+			{ ...ctx(suite({}), resultsDir), artifact },
+		);
+		const evidence = parseProviderArtifactEvidence(
+			readFileSync(join(resultsDir, "provider-artifact-evidence.json"), "utf8"),
+		);
+		expect(evidence.provenance).toEqual({
+			source: "guest-fingerprint",
+			requested: artifact,
+			fingerprint: {
+				authority: "toolchain-manifest-v1",
+				imageName: "sandbox-benchmarks-toolchain",
+				imageVersion: "v8",
+			},
+		});
+	});
+
+	it("fails before benchmarking when a canonical artifact carries a stale guest manifest", async () => {
+		const resultsDir = freshDir();
+		const destroyed = { hit: false };
+		const artifact = { kind: "baked", ref: bakedArtifactName("daytona-vm", "version") } as const;
+		await expect(
+			runSuiteOnSandbox(
+				makeSandbox({
+					destroyed,
+					manifest: JSON.stringify({
+						image_name: "sandbox-benchmarks-toolchain",
+						image_version: "v7",
+					}),
+				}),
+				{ ...ctx(suite({}), resultsDir), artifact },
+			),
+		).rejects.toThrow(/matching sandbox-benchmarks-toolchain@v8/);
+		const evidence = parseProviderArtifactEvidence(
+			readFileSync(join(resultsDir, "provider-artifact-evidence.json"), "utf8"),
+		);
+		expect(evidence.provenance.source).toBe("request-fallback");
+		expect(destroyed.hit).toBe(true);
+		expect(existsSync(join(resultsDir, "pts_node-web-tooling.xml"))).toBe(false);
+	});
+
+	it("captures and persists provider evidence strictly after confirmed teardown", async () => {
+		const resultsDir = freshDir();
+		const destroyed = { hit: false };
+		const calls: string[] = [];
+		const sandbox = makeSandbox({ destroyed, freeKb: "1" });
+		const originalDestroy = sandbox.destroy.bind(sandbox);
+		sandbox.destroy = async () => {
+			calls.push("destroy");
+			return originalDestroy();
+		};
+		await runSuiteOnSandbox(sandbox, {
+			...ctx(suite({ minDiskGb: 50 }), resultsDir),
+			providerName: "modal-gvisor",
+			artifact: { kind: "image", ref: "test-image" },
+			costEvidence: {
+				sdk: { packageName: "modal", version: "0.7.6" },
+				captureAfterTeardown: async (input) => {
+					calls.push("capture");
+					expect(input.teardown.completed).toBe(true);
+					return {
+						kind: "missing",
+						cell: input.cell,
+						subject: { kind: "sandbox", sandboxId: input.sandboxId },
+						capturedAt: "2026-08-08T00:00:00.000Z",
+						sdk: { packageName: "modal", version: "0.7.6" },
+						reason: "unsupported_public_api",
+						detail: "No public sandbox usage endpoint.",
+					};
+				},
+			},
+		});
+		expect(calls).toEqual(["destroy", "capture"]);
+		expect(
+			JSON.parse(readFileSync(join(resultsDir, "provider-cost-evidence.json"), "utf8")),
+		).toMatchObject({
+			cell: { runId: "run-test-1", providerId: "modal-gvisor", suite: "cpu-node" },
+			subject: { sandboxId: "sb-test-1" },
+		});
+	});
+
+	for (const mismatch of ["cell", "sandbox", "sdk"] as const) {
+		it(`replaces a provider response with ${mismatch} mismatch by fixed invalid evidence`, async () => {
+			const resultsDir = freshDir();
+			const sandbox = makeSandbox({ destroyed: { hit: false }, freeKb: "1" });
+			await runSuiteOnSandbox(sandbox, {
+				...ctx(suite({ minDiskGb: 50 }), resultsDir),
+				providerName: "modal-gvisor",
+				artifact: { kind: "image", ref: "test-image" },
+				costEvidence: {
+					sdk: { packageName: "modal", version: "0.7.6" },
+					captureAfterTeardown: async (input) => ({
+						kind: "missing",
+						cell: mismatch === "cell" ? { ...input.cell, runId: "forged-run" } : input.cell,
+						subject: {
+							kind: "sandbox",
+							sandboxId: mismatch === "sandbox" ? "forged-sandbox" : input.sandboxId,
+						},
+						capturedAt: "2026-08-08T00:00:00.000Z",
+						sdk:
+							mismatch === "sdk"
+								? { packageName: "modal", version: "forged-version" }
+								: { packageName: "modal", version: "0.7.6" },
+						reason: "unsupported_public_api",
+						detail: "Untrusted provider detail.",
+					}),
+				},
+			});
+			const persisted = JSON.parse(
+				readFileSync(join(resultsDir, "provider-cost-evidence.json"), "utf8"),
+			) as Record<string, unknown>;
+			expect(persisted).toMatchObject({
+				kind: "missing",
+				reason: "invalid_provider_response",
+				cell: { runId: "run-test-1", providerId: "modal-gvisor", suite: "cpu-node" },
+				subject: { sandboxId: "sb-test-1" },
+				sdk: { packageName: "modal", version: "0.7.6" },
+				detail: "Provider response failed structural or requested-cell binding validation.",
+			});
+		});
+	}
+
+	it("persists no provider error credential canary when capture throws", async () => {
+		const resultsDir = freshDir();
+		const canary = "prefix.SECRET_SUFFIX_CANARY";
+		await runSuiteOnSandbox(makeSandbox({ destroyed: { hit: false }, freeKb: "1" }), {
+			...ctx(suite({ minDiskGb: 50 }), resultsDir),
+			providerName: "modal-gvisor",
+			artifact: { kind: "image", ref: "test-image" },
+			costEvidence: {
+				sdk: { packageName: "modal", version: "0.7.6" },
+				captureAfterTeardown: async () => {
+					throw new Error(`headers={"Authorization":"Bearer ${canary}"}`);
+				},
+			},
+		});
+		const artifact = readFileSync(join(resultsDir, "provider-cost-evidence.json"), "utf8");
+		expect(artifact).not.toContain(canary);
+		expect(artifact).not.toContain("SECRET_SUFFIX_CANARY");
+		expect(JSON.parse(artifact)).toMatchObject({ kind: "missing", reason: "provider_api_error" });
+	});
+
+	it("sanitizes a successful hook responseJson before host persistence", async () => {
+		const resultsDir = freshDir();
+		const bearer = "bearer.SECRET_SUFFIX_CANARY";
+		const basic = "basic.SECRET_SUFFIX_CANARY";
+		const assignment = "assignment.SECRET_SUFFIX_CANARY";
+		const tuple = "tuple.SECRET_SUFFIX_CANARY";
+		const userinfo = "userinfo.SECRET_SUFFIX_CANARY";
+		await runSuiteOnSandbox(makeSandbox({ destroyed: { hit: false }, freeKb: "1" }), {
+			...ctx(suite({ minDiskGb: 50 }), resultsDir),
+			providerName: "modal-gvisor",
+			artifact: { kind: "image", ref: "test-image" },
+			costEvidence: {
+				sdk: { packageName: "modal", version: "0.7.6" },
+				captureAfterTeardown: async (input) => ({
+					kind: "observed",
+					cell: input.cell,
+					subject: { kind: "sandbox", sandboxId: input.sandboxId },
+					capturedAt: "2026-08-08T00:00:00.000Z",
+					sdk: { packageName: "modal", version: "0.7.6" },
+					apiOperation: "sandbox.cost",
+					usage: [{ resource: "cpu", quantity: 1, unit: "second" }],
+					amount: 1,
+					currency: "USD",
+					source: "provider_reported",
+					responseJson: JSON.stringify({
+						authorization: `Bearer ${bearer}`,
+						logA: `api_key=${assignment}&access_token=${assignment} token=${assignment} secret=${assignment} password=${assignment}`,
+						logB: `cookie=${assignment}; session=${assignment}`,
+						headerText: `Authorization: Basic ${basic}`,
+						logC: `X-Api-Key: ${assignment}`,
+						bare: `Bearer ${bearer} Basic ${basic}`,
+						tuples: [
+							["Authorization", `Bearer ${tuple}`],
+							["X-Api-Key", tuple],
+						],
+						url: `https://user:${userinfo}@vendor.invalid/path`,
+					}),
+				}),
+			},
+		});
+		const artifact = readFileSync(join(resultsDir, "provider-cost-evidence.json"), "utf8");
+		expect(artifact).not.toContain(bearer);
+		expect(artifact).not.toContain(basic);
+		expect(artifact).not.toContain(assignment);
+		expect(artifact).not.toContain(tuple);
+		expect(artifact).not.toContain(userinfo);
+		const persisted = JSON.parse(artifact) as { responseJson: string };
+		const response = JSON.parse(persisted.responseJson) as Record<string, unknown>;
+		expect(response).toMatchObject({
+			authorization: "[REDACTED]",
+			bare: "Bearer [REDACTED] Basic [REDACTED]",
+			headerText: "Authorization: Basic [REDACTED]",
+			logA: "api_key=[REDACTED]&access_token=[REDACTED] token=[REDACTED] secret=[REDACTED] password=[REDACTED]",
+			logB: "cookie=[REDACTED]; session=[REDACTED]",
+			logC: "X-Api-Key: [REDACTED]",
+			url: "https://[REDACTED]@vendor.invalid/path",
+		});
+		expect(response.tuples).toEqual([
+			["Authorization", "[REDACTED]"],
+			["X-Api-Key", "[REDACTED]"],
+		]);
+	});
+
+	it("rejects accessors, deep objects, and proxies before ArkType traversal", async () => {
+		for (const shape of ["accessor", "deep", "root-proxy", "nested-proxy"] as const) {
+			const resultsDir = freshDir();
+			let getterCalls = 0;
+			await runSuiteOnSandbox(makeSandbox({ destroyed: { hit: false }, freeKb: "1" }), {
+				...ctx(suite({ minDiskGb: 50 }), resultsDir),
+				providerName: "modal-gvisor",
+				artifact: { kind: "image", ref: "test-image" },
+				costEvidence: {
+					sdk: { packageName: "modal", version: "0.7.6" },
+					captureAfterTeardown: async (input) => {
+						const returned: Record<string, unknown> = {
+							kind: "missing",
+							cell: input.cell,
+							subject: { kind: "sandbox", sandboxId: input.sandboxId },
+							capturedAt: "2026-08-08T00:00:00.000Z",
+							sdk: { packageName: "modal", version: "0.7.6" },
+							reason: "unsupported_public_api",
+							detail: "fixed",
+						};
+						if (shape === "accessor") {
+							Object.defineProperty(returned, "extra", {
+								enumerable: true,
+								get: () => {
+									getterCalls++;
+									return "secret";
+								},
+							});
+						} else if (shape === "deep") {
+							let nested: Record<string, unknown> = {};
+							returned.extra = nested;
+							for (let index = 0; index < 20; index++) nested = nested.next = {};
+						} else if (shape === "nested-proxy") {
+							returned.extra = new Proxy({ safe: true }, {});
+						}
+						return (
+							shape === "root-proxy" ? new Proxy(returned, {}) : returned
+						) as ProviderCostEvidence;
+					},
+				},
+			});
+			expect(getterCalls).toBe(0);
+			expect(
+				JSON.parse(readFileSync(join(resultsDir, "provider-cost-evidence.json"), "utf8")),
+			).toMatchObject({
+				kind: "missing",
+				reason: "invalid_provider_response",
+			});
+		}
+	});
 	it("runs the suite, collects results, and tears the sandbox down", async () => {
 		const resultsDir = freshDir();
 		const destroyed = { hit: false };
@@ -623,6 +1205,45 @@ describe("runSuiteOnSandbox (orchestration + teardown)", () => {
 			outcome: "failed",
 			reason: expect.stringMatching(/never ready/),
 		});
+	});
+
+	it("cancels and settles DriverModule readiness before tearing the sandbox down", async () => {
+		const resultsDir = freshDir();
+		const destroyed = { hit: false };
+		const events: string[] = [];
+		const base = makeSandbox({ destroyed });
+		const sandbox: SandboxHandle = {
+			...base,
+			async destroy() {
+				events.push("destroy");
+				return base.destroy();
+			},
+		};
+
+		await expect(
+			runSuiteOnSandbox(sandbox, {
+				...ctx(suite({}), resultsDir),
+				driverReadiness: {
+					timeoutMs: 10,
+					verify: ({ signal }) =>
+						new Promise((_resolve, reject) => {
+							signal.addEventListener(
+								"abort",
+								() => {
+									events.push("abort");
+									queueMicrotask(() => {
+										events.push("settled");
+										reject(signal.reason);
+									});
+								},
+								{ once: true },
+							);
+						}),
+				},
+			}),
+		).rejects.toThrow(/exceeded its 10ms policy budget/);
+		expect(events).toEqual(["abort", "settled", "destroy"]);
+		expect(destroyed.hit).toBe(true);
 	});
 
 	it("tears the sandbox down when an invalid ptsTimesToRun (k < 1) fails preamble construction", async () => {

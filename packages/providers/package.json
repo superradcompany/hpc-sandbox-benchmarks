@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./config": "./src/config.ts",
+    "./support": "./src/support.ts"
   },
   "scripts": {
     "test": "bun test",
@@ -15,14 +17,17 @@
     "@computesdk/blaxel": "catalog:computesdk",
     "@computesdk/daytona": "catalog:computesdk",
     "@computesdk/e2b": "catalog:computesdk",
-    "@computesdk/modal": "catalog:computesdk",
     "@computesdk/namespace": "catalog:computesdk",
     "@computesdk/provider": "catalog:computesdk",
+    "@computesdk/runloop": "catalog:computesdk",
+    "@runloop/api-client": "catalog:computesdk",
+    "@run-cloud/sdk": "catalog:computesdk",
     "@sandbox-benchmarks/schema": "workspace:*",
     "arktype": "catalog:",
     "computesdk": "catalog:computesdk",
     "microsandbox": "catalog:computesdk",
-    "novita-sandbox": "catalog:computesdk"
+    "novita-sandbox": "catalog:computesdk",
+    "@vercel/sandbox": "catalog:computesdk"
   },
   "devDependencies": {
     "@repo/tsconfig": "workspace:*",

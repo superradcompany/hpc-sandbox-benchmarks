@@ -8,13 +8,24 @@
 // Run/Metric/provider identity (see schema/analysis.ts `seededRng`), and `generatedAt` is read from the
 // Run document rather than the clock. A Math.random() bootstrap would make this gate flake on every run.
 import { describe, expect, it, setDefaultTimeout } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+// Safe in a browser-free gate: importing the screenshot module costs nothing — only calling
+// screenshotHtml spawns Chrome — and webpDimensions is the pure header parse the captures
+// themselves are verified with.
+import { webpDimensions } from "@sandbox-benchmarks/figures/screenshot";
+import type { LeaderboardFigure } from "@sandbox-benchmarks/results";
 import {
+	benchmarkDataOf,
 	buildLeaderboard,
 	DATASET_RUNS_DIR,
+	FIGURE_DEVICE_SCALE,
+	FIGURE_DIMENSION,
 	LEADERBOARD_DIMENSION_ORDER,
+	LEADERBOARD_FIGURE_DIR,
+	leaderboardFigures,
 	REPO_URL,
+	renderLeaderboardFigureHtml,
 	renderLeaderboardMarkdown,
 	SYNTHETIC_DIMENSIONS,
 } from "@sandbox-benchmarks/results";
@@ -41,15 +52,23 @@ const runFile = (runId: string) => join(ROOT, ...DATASET_RUNS_DIR.split("/"), `$
 const regenCmd = (runId: string) =>
 	`bun apps/cli/src/bin/leaderboard.ts ${DATASET_RUNS_DIR}/${runId}.json LEADERBOARD.md`;
 
-/** Independent R-7 percentile implementation for auditing the persisted Aggregates and displayed p50. */
-function auditPercentile(samples: readonly number[], p: number): number {
-	const sorted = [...samples].sort((a, b) => a - b);
+/** R-7 percentile of an ALREADY-SORTED buffer. Split out so the bootstraps below can sort one reused
+ *  scratch buffer in place instead of allocating a fresh sorted copy per resample — the audit still
+ *  reaches its order statistics BY SORTING, deliberately unlike the quickselect the renderer uses, so
+ *  the two remain independent implementations. */
+function auditPercentileOfSorted(sorted: ArrayLike<number>, p: number): number {
 	const h = (sorted.length - 1) * p;
 	const lo = Math.floor(h);
 	const hi = Math.ceil(h);
 	const a = sorted[lo] as number;
 	const b = sorted[hi] as number;
 	return a + (h - lo) * (b - a);
+}
+
+/** Independent R-7 percentile implementation for auditing the persisted Aggregates and displayed p50. */
+function auditPercentile(samples: readonly number[], p: number): number {
+	const sorted = [...samples].sort((a, b) => a - b);
+	return auditPercentileOfSorted(sorted, p);
 }
 
 /** Conventional two-pass aggregates: intentionally separate from schema.aggregate's Welford path. */
@@ -91,52 +110,59 @@ function auditMedianInterval(
 ): { lo: number; hi: number } | null {
 	if (samples.length === 1) return null;
 	const rng = auditRng(seed);
-	const medians = new Array<number>(10_000);
+	const n = samples.length;
+	const medians = new Float64Array(10_000);
+	// One scratch draw for all 10 000 resamples: a fresh Array per resample dominated this gate's
+	// runtime, and each draw is dead the moment its median is read.
+	const draw = new Float64Array(n);
 	for (let iteration = 0; iteration < medians.length; iteration++) {
-		const draw = Array.from(
-			{ length: samples.length },
-			() => samples[Math.floor(rng() * samples.length)] as number,
-		);
-		medians[iteration] = auditPercentile(draw, 0.5);
+		for (let i = 0; i < n; i++) draw[i] = samples[Math.floor(rng() * n)] as number;
+		draw.sort();
+		medians[iteration] = auditPercentileOfSorted(draw, 0.5);
 	}
+	medians.sort();
 	const tail = (1 - 0.95) / 2;
 	return {
-		lo: auditPercentile(medians, tail),
-		hi: auditPercentile(medians, 1 - tail),
+		lo: auditPercentileOfSorted(medians, tail),
+		hi: auditPercentileOfSorted(medians, 1 - tail),
 	};
 }
 
 /**
- * Independently reproduce the seeded 10k HIERARCHICAL median bootstrap the renderer uses once a Metric
- * carries a replicate breakdown (≥2 sandboxes): each resample draws R replicates WITH REPLACEMENT, then
- * within each drawn replicate draws its own Samples with replacement, pools the lot, and takes the median.
- * Mirrors schema/analysis.ts `hierarchicalBootstrapMedianInterval` — including the single shared RNG's
- * exact draw order (replicate index, then that replicate's sample indices, R times) — so the reproduced
- * bounds are byte-identical to the committed table rather than merely statistically close.
+ * Independently reproduce the seeded 10k CLUSTER bootstrap the renderer uses once a Metric carries a
+ * replicate breakdown (≥2 sandboxes): summarise each sandbox by its own median, then draw R of those
+ * summaries WITH REPLACEMENT and take the median of the draw. Whole sandboxes are resampled INTACT —
+ * there is deliberately no second, within-sandbox resampling stage, because each sandbox's observed
+ * Samples already carry one realization of that machine's within-noise and drawing them again would
+ * add a second copy of it.
+ *
+ * Mirrors schema/analysis.ts `clusterMedianInterval` — including the single shared RNG's exact draw
+ * order (R summary indices per resample) — so the reproduced bounds are byte-identical to the committed
+ * table rather than merely statistically close. Reaches its order statistics BY SORTING, deliberately
+ * unlike the renderer's quickselect, so the two stay independent implementations.
  */
-function auditHierarchicalMedianInterval(
+function auditClusterMedianInterval(
 	replicates: readonly (readonly number[])[],
 	seed: string,
 ): { lo: number; hi: number } | null {
-	// The pooled union is what the displayed median ranks on; a single pooled Sample has no spread, so the
-	// renderer degenerates to a point interval (rendered "—"), matching auditMedianInterval's n=1 return.
-	if (replicates.reduce((sum, replicate) => sum + replicate.length, 0) === 1) return null;
+	// One sandbox carries no between-machine information, so the renderer degenerates to a point interval
+	// (rendered "—"). Note this keys on the SANDBOX count, not the pooled Sample count.
+	if (replicates.length === 1) return null;
+	const summaries = replicates.map((replicate) => auditPercentile(replicate, 0.5));
 	const rng = auditRng(seed);
-	const R = replicates.length;
-	const medians = new Array<number>(10_000);
+	const R = summaries.length;
+	const medians = new Float64Array(10_000);
+	const draw = new Float64Array(R);
 	for (let iteration = 0; iteration < medians.length; iteration++) {
-		const pool: number[] = [];
-		for (let r = 0; r < R; r++) {
-			const chosen = replicates[Math.floor(rng() * R)] as readonly number[];
-			for (let i = 0; i < chosen.length; i++)
-				pool.push(chosen[Math.floor(rng() * chosen.length)] as number);
-		}
-		medians[iteration] = auditPercentile(pool, 0.5);
+		for (let i = 0; i < R; i++) draw[i] = summaries[Math.floor(rng() * R)] as number;
+		draw.sort();
+		medians[iteration] = auditPercentileOfSorted(draw, 0.5);
 	}
+	medians.sort();
 	const tail = (1 - 0.95) / 2;
 	return {
-		lo: auditPercentile(medians, tail),
-		hi: auditPercentile(medians, 1 - tail),
+		lo: auditPercentileOfSorted(medians, tail),
+		hi: auditPercentileOfSorted(medians, 1 - tail),
 	};
 }
 
@@ -157,6 +183,7 @@ interface AuditRow {
 	rank: number;
 	interval: string;
 	n: number;
+	sandboxes: number;
 	note: string;
 	p: string;
 	ks: string;
@@ -167,13 +194,19 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 	const candidates = run.providers.flatMap((provider) => {
 		const result = provider.metrics.find(({ metricId }) => metricId === metric.id);
 		if (!result) return [];
-		const value = auditPercentile(result.samples, 0.5);
-		// Mirror the renderer's branch: once a Metric merged ≥2 replicate sandboxes it takes the
-		// hierarchical bootstrap (between-sandbox variance), else the ordinary percentile bootstrap.
 		const seed = `${run.runId}:${metric.id}:${provider.providerId}`;
 		const replicates = result.replicates?.map((replicate) => replicate.samples);
+		// Mirror the renderer's branch: with ≥2 replicate sandboxes the value is the median of the
+		// per-sandbox medians (one machine one vote, NOT the pooled trials) and the interval is the
+		// cluster bootstrap of that same statistic; without them, the ordinary percentile bootstrap.
+		const value = replicates
+			? auditPercentile(
+					replicates.map((replicate) => auditPercentile(replicate, 0.5)),
+					0.5,
+				)
+			: auditPercentile(result.samples, 0.5);
 		const interval = replicates
-			? auditHierarchicalMedianInterval(replicates, seed)
+			? auditClusterMedianInterval(replicates, seed)
 			: auditMedianInterval(result.samples, seed);
 		return [
 			{
@@ -202,6 +235,7 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 				...candidate,
 				rank: 1,
 				n: candidate.result.samples.length,
+				sandboxes: candidate.result.replicates?.length ?? 1,
 				note: "",
 				p: "—",
 				ks: "—",
@@ -231,6 +265,7 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 			// exact cluster permutation, never the bootstrapped difference interval.
 			const previousReplicates = previousCandidate.result.replicates?.map((r) => r.samples);
 			const candidateReplicates = candidate.result.replicates?.map((r) => r.samples);
+			let clusterP = Number.NaN;
 			if (previousReplicates || candidateReplicates) {
 				const cluster = mannWhitneyU(
 					(previousReplicates ?? [previousCandidate.result.samples]).map((c) =>
@@ -238,10 +273,12 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 					),
 					(candidateReplicates ?? [candidate.result.samples]).map((c) => auditPercentile(c, 0.5)),
 				);
+				clusterP = cluster.pValue;
 				// The between-sandbox floor already meets α (2/C(6,3)=0.1 at R=3) → underpowered, never a
 				// tie; else the cluster test's own p decides separation.
 				if (cluster.minAttainablePValue >= DEFAULT_ALPHA) {
-					note = identical ? "n too small, equal medians" : "n too small";
+					// The cluster path decided, so the binding constraint is the SANDBOX count, not `n`.
+					note = identical ? "too few sandboxes, equal medians" : "too few sandboxes";
 					if (identical) rank = previousRow.rank;
 				} else if (cluster.pValue >= DEFAULT_ALPHA) {
 					rank = previousRow.rank;
@@ -254,7 +291,11 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 				rank = previousRow.rank;
 				note = "tied";
 			}
-			p = `${formatPValue(mw.pValue)}${note ? ` (${note})` : ""}`;
+			// The rendered `p vs. above` is the p of the test that DECIDED — the cluster test wherever
+			// replicate sandboxes exist, the pooled Mann-Whitney only where a single sandbox left nothing
+			// else to test on. `p (KS)` stays the pooled shape diagnostic.
+			const decidingP = previousReplicates || candidateReplicates ? clusterP : mw.pValue;
+			p = `${formatPValue(decidingP)}${note ? ` (${note})` : ""}`;
 			ks = formatPValue(shape.pValue);
 		}
 
@@ -262,6 +303,7 @@ function auditRows(run: Run, metric: MetricDef): AuditRow[] {
 			...candidate,
 			rank,
 			n: candidate.result.samples.length,
+			sandboxes: candidate.result.replicates?.length ?? 1,
 			note,
 			p: p === "—" && note ? `— (${note})` : p,
 			ks,
@@ -275,6 +317,8 @@ interface MarkdownMetricRow {
 	provider: string;
 	value: string;
 	interval: string;
+	/** Sandboxes (the unit of replication) and pooled trials — rendered as two distinct columns. */
+	sandboxes: string;
 	n: string;
 	note: string;
 }
@@ -312,7 +356,7 @@ function parseMetricTables(markdown: string, emitted: Map<string, MetricDef>) {
 				.slice(1, -1)
 				.split("|")
 				.map((cell) => cell.trim());
-			const [rank, provider, value, interval, n, rawNote] = cells;
+			const [rank, provider, value, interval, sandboxes, n, rawNote] = cells;
 			const note = rawNote === "—" || rawNote === undefined ? "" : rawNote;
 			const key = metric.id;
 			const metricRows = rows.get(key) ?? [];
@@ -321,6 +365,7 @@ function parseMetricTables(markdown: string, emitted: Map<string, MetricDef>) {
 				provider: provider as string,
 				value: value as string,
 				interval: interval as string,
+				sandboxes: sandboxes as string,
 				n: n as string,
 				note,
 			});
@@ -378,12 +423,20 @@ function loadCommittedRun(): {
 	committed: string;
 	runId: string;
 	run: ReturnType<typeof parseRun>;
+	/** The figures the Markdown must link. Re-DERIVED from the Run, exactly as the bin derives
+	 *  them, rather than parsed back out of the committed document — a gate that read the links it
+	 *  is checking would agree with any set of links at all. Browser-free: this is the list, not
+	 *  the pixels. The rasters themselves are deliberately NOT re-rendered here — Chrome's output is
+	 *  not byte-stable across machines, so pixel identity is unassertable in a gate that must pass
+	 *  on every contributor's machine; the update workflow is where pixels are authored. */
+	figures: LeaderboardFigure[];
 } {
 	const committed = readFileSync(ARTIFACT, "utf8");
 	const runId = runIdOf(committed);
 	const source = runFile(runId);
 	try {
-		return { committed, runId, run: parseRun(JSON.parse(readFileSync(source, "utf8"))) };
+		const run = parseRun(JSON.parse(readFileSync(source, "utf8")));
+		return { committed, runId, run, figures: leaderboardFigures(benchmarkDataOf(run)) };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			// A named Run that isn't in the committed dataset means the artifact was rendered from the
@@ -396,6 +449,22 @@ function loadCommittedRun(): {
 		}
 		throw error;
 	}
+}
+
+/**
+ * ONE canonical board — "what the renderer produces from the committed Run right now" — used by every
+ * test below, including the determinism check, whose SECOND operand is deliberately a fresh build from
+ * a freshly parsed Run. Building a board is the most expensive thing in this package, and the tests
+ * were paying for four of them to ask three questions.
+ *
+ * Memoized lazily, never at module scope, for the same reason {@link loadCommittedRun} is called inside
+ * each test: a throw here must surface as the failure of the test that asked for it, not abort the file
+ * during collection and silently take the other checks with it.
+ */
+let sharedBoard: ReturnType<typeof buildLeaderboard> | undefined;
+function committedBoard(): ReturnType<typeof buildLeaderboard> {
+	sharedBoard ??= buildLeaderboard(loadCommittedRun().run);
+	return sharedBoard;
 }
 
 // This gate renders the WHOLE committed board — up to twice, for the determinism check — and both the
@@ -467,14 +536,13 @@ describe("LEADERBOARD.md leads with the real-world workflows", () => {
 		);
 	});
 
-	it("collapses every synthetic dimension and leaves every other one expanded", () => {
-		const { committed } = loadCommittedRun();
-		// Read each `## <dimension>` section's body and ask whether it opens a disclosure block. Parsed
-		// from the committed text, not from the renderer's intent, so this catches an unclosed <details>
-		// swallowing the section after it just as readily as a missing one.
+	/** Each `## <dimension>` section's body, keyed by dimension. Parsed from the committed text, not
+	 *  from the renderer's intent, so an unclosed <details> that swallows the section after it fails
+	 *  as readily as a missing one. */
+	const dimensionSections = (markdown: string): Map<string, string[]> => {
 		const sections = new Map<string, string[]>();
 		let current: string | undefined;
-		for (const line of dimensionBody(committed).split("\n")) {
+		for (const line of dimensionBody(markdown).split("\n")) {
 			if (line.startsWith("## ")) {
 				const heading = line.slice(3);
 				current = (LEADERBOARD_DIMENSION_ORDER as readonly string[]).includes(heading)
@@ -485,17 +553,30 @@ describe("LEADERBOARD.md leads with the real-world workflows", () => {
 			}
 			if (current) sections.get(current)?.push(line);
 		}
+		return sections;
+	};
+
+	it("collapses the tables of every synthetic dimension and of the figure dimension, and no others", () => {
+		const { committed, figures } = loadCommittedRun();
+		const sections = dimensionSections(committed);
 		expect(sections.size).toBeGreaterThan(0);
 
 		for (const [dimension, body] of sections) {
-			const synthetic = SYNTHETIC_DIMENSIONS.has(dimension as never);
+			// The figure dimension collapses for a DIFFERENT reason than the synthetics — its charts
+			// replace the tables as the thing you read, rather than the axis being a side question — but
+			// it only earns the collapse when there are charts. A board with no chartable suite renders
+			// its tables in the open, because hiding them behind a triangle whose figures do not exist
+			// would take the numbers off the page entirely.
+			const collapses =
+				SYNTHETIC_DIMENSIONS.has(dimension as never) ||
+				(dimension === FIGURE_DIMENSION && figures.length > 0);
 			const opens = body.filter((line) => line === "<details>").length;
 			const closes = body.filter((line) => line === "</details>").length;
-			expect(opens, `${dimension} <details> count`).toBe(synthetic ? 1 : 0);
-			expect(closes, `${dimension} </details> count`).toBe(synthetic ? 1 : 0);
-			if (synthetic) {
-				// The heading itself stays OUTSIDE the collapse (it is above this body), and the summary
-				// names what is hidden — a shut section must still disclose that the axis was measured.
+			expect(opens, `${dimension} <details> count`).toBe(collapses ? 1 : 0);
+			expect(closes, `${dimension} </details> count`).toBe(collapses ? 1 : 0);
+			if (collapses) {
+				// The heading stays OUTSIDE the collapse (it is above this body), and the summary names
+				// what is hidden — a shut section must still disclose what it holds.
 				expect(
 					body.some((line) => line.startsWith("<summary>")),
 					`${dimension} summary`,
@@ -505,6 +586,55 @@ describe("LEADERBOARD.md leads with the real-world workflows", () => {
 				);
 			}
 		}
+	});
+
+	it("puts every suite chart above the figure dimension's collapse, and links no other image", () => {
+		const { committed, figures } = loadCommittedRun();
+		expect(figures.length).toBeGreaterThan(0);
+		const body = dimensionSections(committed).get(FIGURE_DIMENSION);
+		expect(body, `no ${FIGURE_DIMENSION} section`).toBeDefined();
+		const lines = body as string[];
+
+		// ABOVE the collapse is the whole editorial point: a chart folded inside the triangle would be
+		// a section that still looks like seventeen tables.
+		const collapseAt = lines.indexOf("<details>");
+		expect(collapseAt).toBeGreaterThan(0);
+		// The charts are `<img src width alt>` rather than bare Markdown images: the images are 2×
+		// rasters, and the width attribute is what shows them at logical size on GitHub.
+		const images = lines
+			.flatMap((line, index) => {
+				const match = line.match(/^<img src="([^"]+)" width="(\d+)" alt="([^"]*)">$/);
+				return match
+					? [
+							{
+								index,
+								src: match[1] as string,
+								width: Number(match[2]),
+								alt: match[3] as string,
+							},
+						]
+					: [];
+			})
+			.filter(({ index }) => index < collapseAt);
+
+		// Exactly the rendered set, in the rendered order — not a superset, and not "at least one".
+		expect(images.map(({ src }) => src)).toEqual(figures.map((figure) => figure.file));
+		for (const [index, image] of images.entries()) {
+			const figure = figures[index] as LeaderboardFigure;
+			// The width attribute must say the figure's logical width, or the 2× raster renders at
+			// double size and the column layout breaks.
+			expect(image.width, `${figure.suiteId} width`).toBe(figure.width);
+			// Alt text is what a reader with the image unavailable gets INSTEAD of the section, so an
+			// empty one is a section that vanishes. Name the suite at minimum.
+			expect(image.alt, `${figure.suiteId} alt text`).toContain(figure.suiteName);
+		}
+		// And the whole document embeds no image the figure list does not name — in either syntax —
+		// so a hand-added screenshot cannot ride along unrendered and unregenerated.
+		const everyImage = [
+			...[...committed.matchAll(/^!\[[^\]]*\]\(([^)]+)\)$/gm)].map((match) => match[1] as string),
+			...[...committed.matchAll(/<img src="([^"]+)"/gm)].map((match) => match[1] as string),
+		];
+		expect(everyImage.sort()).toEqual(figures.map((figure) => figure.file).sort());
 	});
 });
 
@@ -527,8 +657,8 @@ describe("LEADERBOARD.md stays in sync with the renderer", () => {
 	});
 
 	it("is byte-identical to a fresh render of the Run it names", () => {
-		const { committed, runId, run } = loadCommittedRun();
-		const rendered = renderLeaderboardMarkdown(buildLeaderboard(run));
+		const { committed, runId, figures } = loadCommittedRun();
+		const rendered = renderLeaderboardMarkdown(committedBoard(), figures);
 		if (committed !== rendered) {
 			// Name the remedy in the failure, rather than leaving whoever hits this to work it out.
 			throw new Error(
@@ -539,18 +669,86 @@ describe("LEADERBOARD.md stays in sync with the renderer", () => {
 		expect(committed).toBe(rendered);
 	});
 
+	it("every linked figure is a committed WebP with the geometry the document promises", () => {
+		// What CAN be asserted about the pixels without a browser. The images are authored by the
+		// update workflow's pinned Chrome — re-rendering them here would need that Chrome and would
+		// still differ byte-for-byte on any other machine, so freshness of the raster is the release
+		// job's concern, not this gate's. But a linked file that is missing, is not a WebP, or has the
+		// wrong pixel width is structurally broken on every machine, and each of those has a way to
+		// happen (a render aborted between write and commit; a hand-swapped screenshot; a chart
+		// rasterised at 1×) that would otherwise surface only on the published page.
+		const { runId, figures } = loadCommittedRun();
+		for (const figure of figures) {
+			const path = join(ROOT, ...figure.file.split("/"));
+			let bytes: Uint8Array;
+			try {
+				bytes = readFileSync(path);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+					throw new Error(
+						`${figure.file} is linked by LEADERBOARD.md but not committed. The bin writes the ` +
+							`charts alongside the Markdown:\n  ${regenCmd(runId)}`,
+					);
+				}
+				throw error;
+			}
+			// The raster must be exactly FIGURE_DEVICE_SCALE × the logical width the <img> tag
+			// displays it at. Parsed through the screenshotter's own webpDimensions — the same
+			// header read the capture was verified with — so the gate and the producer cannot
+			// drift into asserting different container semantics.
+			expect(webpDimensions(bytes).width, `${figure.file} pixel width`).toBe(
+				figure.width * FIGURE_DEVICE_SCALE,
+			);
+		}
+	});
+
+	it("the figure directory holds exactly the charts the document links", () => {
+		// The orphan case: a chart for a suite that stopped being chartable stays committed, stays
+		// stale forever, and stays green. An unlinked image in a published repo is worse than a
+		// missing one — it looks current and nothing ever regenerates it. Every entry is compared,
+		// not just known image extensions, so a stray file cannot squat in the published directory.
+		// Dotfiles are the one exception: Finder writes `.DS_Store` into any directory a macOS
+		// contributor so much as opens (it is gitignored), and a hidden file failing the artifact
+		// gate on an unrelated branch would be a machine-shape failure, not a repo state.
+		const { figures } = loadCommittedRun();
+		const dir = join(ROOT, ...LEADERBOARD_FIGURE_DIR.split("/"));
+		const onDisk = readdirSync(dir)
+			.filter((entry) => !entry.startsWith("."))
+			.map((entry) => `${LEADERBOARD_FIGURE_DIR}/${entry}`)
+			.sort();
+		expect(onDisk).toEqual(figures.map((figure) => figure.file).sort());
+	});
+
+	it("renders the same chart HTML twice, so a figure regeneration is reviewable", () => {
+		// The deterministic half of the figure pipeline, held to determinism. The rasters are Chrome's
+		// and vary by machine; the HTML they are made from is pure string building and must not —
+		// a nondeterministic document would make every workflow dispatch commit figure churn that
+		// reviews as noise. (The CLI holds the other half of this line: it rasterises every chart
+		// twice and fails on a byte mismatch, catching nondeterminism that only shows up in paint.)
+		const { run } = loadCommittedRun();
+		const first = renderLeaderboardFigureHtml(run);
+		const second = renderLeaderboardFigureHtml(run);
+		expect(first.map(({ html }) => html)).toEqual(second.map(({ html }) => html));
+	});
+
 	it("renders the same bytes twice, so this gate can't flake on an unseeded bootstrap", () => {
 		// Loads independently of the test above: each resolves the Run itself, so one failing reports
-		// its own diagnosis instead of aborting the file and taking the other down with it.
-		const { run } = loadCommittedRun();
-		expect(renderLeaderboardMarkdown(buildLeaderboard(run))).toBe(
-			renderLeaderboardMarkdown(buildLeaderboard(run)),
-		);
+		// its own diagnosis instead of aborting the file and taking the other down with it. The fresh
+		// build is deliberately fed a freshly parsed Run rather than the shared board's — two builds from
+		// two independent parses is what regenerating the artifact actually does.
+		const { run, figures } = loadCommittedRun();
+		// Mutation is asserted SEPARATELY, not inferred from the byte comparison: because the two builds
+		// read two independently parsed Runs, a `buildLeaderboard` that mutated its input after reading it
+		// would still render identical bytes and slip through. Snapshot the Run and diff it afterwards.
+		const before = JSON.stringify(run);
+		const rendered = renderLeaderboardMarkdown(buildLeaderboard(run), figures);
+		expect(JSON.stringify(run), "buildLeaderboard mutated the Run it was given").toBe(before);
+		expect(renderLeaderboardMarkdown(committedBoard(), figures)).toBe(rendered);
 	});
 
 	it("renders one row for every provider/Metric record in the source Run", () => {
 		const { run } = loadCommittedRun();
-		const board = buildLeaderboard(run);
+		const board = committedBoard();
 		const expected = run.providers
 			.flatMap((provider) =>
 				provider.metrics
@@ -648,6 +846,7 @@ describe("LEADERBOARD.md stays in sync with the renderer", () => {
 				provider: row.displayName,
 				value: formatValue(row.value),
 				interval: row.interval,
+				sandboxes: String(row.sandboxes),
 				n: String(row.n),
 				note: row.note,
 			}));

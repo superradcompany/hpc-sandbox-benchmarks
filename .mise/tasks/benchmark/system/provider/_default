@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+#MISE description="Identify a sandbox: egress ASN/geo, SMBIOS identity, the exact isolation technique (Firecracker/libkrun/gVisor/Sysbox/Kata/LXC/…), and Docker-in-Docker readiness"
+# Two questions the benchmark matrix needs answered about every sandbox, and one capability check:
+#
+#   WHOSE NETWORK  — the ASN that announces the public egress IP (lib/lib/probe/egress.sh).
+#   WHAT IS CONFINING IT — the specific VMM and/or container runtime (lib/probe/isolation/main.sh).
+#   CAN IT NEST CONTAINERS — Docker-in-Docker readiness, assessed passively (lib/probe/isolation/main.sh).
+#
+# Both halves live in lib/ because each is a self-contained probe with its own contract, and because
+# the isolation engine's classify step is a pure function of its collected signals — separable, and
+# therefore checkable against recorded signal sets for hardware nobody has to own. This file is the
+# orchestrator: run the probes, print the report, emit the record.
+#
+# WHAT THIS DELIBERATELY DOES NOT RECORD — because something else in the same result directory
+# already does. The Phoronix Test Suite writes a `<System>` block into every result file it produces
+# (`phoronix-test-suite system-info` is the same data), and the harness writes observed-specs.json
+# before any suite runs. Between them the dataset already carries the CPU model, core and thread
+# counts, memory size, kernel release and architecture, OS, compiler, disk size, filesystem, mount
+# options, scheduler, microcode and the coarse `System Layer`. Duplicating those here bought nothing
+# and cost a field in every host record: packages/results/src/lib/specs.ts merges observed-specs.json
+# OVER this record, so our copies were never even read. A field is published below only when it is
+#
+#   (1) projected onto ObservedSpecs by specs.ts and supplied by nothing else — the SMBIOS identity
+#       and the whole egress block; or
+#   (2) an INPUT to the isolation classifier; or
+#   (3) an OUTPUT of it.
+#
+# Anything else — the raw command line, cgroup paths, the overlay upperdir, pid 1, seccomp and LSM
+# details — stays private to the classifier. Several of those identify a single sandbox or can carry
+# a control-plane token, and the dataset folds host records by identity, so rendering or publishing
+# one would both leak and defeat the fold.
+#
+# Tolerant probe: no -e — report whatever the sandbox exposes (error-mode conventions: lib/bench.sh).
+set -uo pipefail
+REPO_ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+source "${REPO_ROOT}/lib/bench.sh"
+source "${REPO_ROOT}/lib/probe/egress.sh"
+source "${REPO_ROOT}/lib/probe/isolation/main.sh"
+
+RESULT_NAME="$(task_result_name)"
+RESULT_FILE="$(result_path "$RESULT_NAME")"
+SCHEMA_VERSION="2.0"
+
+# Network first, and its result handed to the isolation probe explicitly: libkrun's TSI networking is
+# visible only as "egress works AND there is no interface at all", and the egress half belongs to the
+# other library. Passing it as an input keeps the two independent — neither reads the other's globals.
+egress_probe
+isolation_collect
+ISO_EGRESS_OK=false
+[ -n "$PUBLIC_IP" ] && ISO_EGRESS_OK=true
+isolation_classify
+isolation_dind
+
+egress_report
+echo
+isolation_report
+echo
+echo "note: the egress ASN describes the public network path, not necessarily the compute host."
+echo "      the isolation verdict is an in-sandbox observation; the declared per-provider technology"
+echo "      (packages/schema/src/providers.ts) stays authoritative when the two disagree."
+echo "      generic KVM/virtio evidence alone never names a VMM — it scores the 'microvm-unidentified'"
+echo "      bucket, which is capped below every named candidate."
+echo "      CPU/memory/kernel/OS/disk are recorded by the PTS <System> block and observed-specs.json,"
+echo "      not here. Docker-in-Docker is assessed passively; no daemon is started, no container run."
+
+# ONE ordered name/value list builds the record, for both writers below. The earlier form spelled
+# every field twice — once as a `--arg` flag, once in a printf format string — in two lists nothing
+# kept in agreement. Adding a field here reaches both paths by construction.
+#
+# The egress and SMBIOS names are the v1 field names, unchanged and in their original order:
+# packages/results/src/lib/specs.ts joins this record onto ObservedSpecs by those exact keys, and the
+# committed raw tree is re-normalized retroactively, so renaming one silently blanks a leaderboard
+# column for every past and future run.
+RECORD_FIELDS=(
+	public_ip "$PUBLIC_IP"
+	org "$ORG"
+	asn "$ASN"
+	org_name "$ORG_NAME"
+	reverse_dns "$REVERSE_DNS"
+	city "$CITY"
+	region "$REGION"
+	country "$COUNTRY"
+	loc "$LOC"
+	timezone "$TIMEZONE"
+	prefix "$PREFIX"
+	asn_source "$ASN_SOURCE"
+	geo_source "$GEO_SOURCE"
+	manufacturer "$ISO_MANUFACTURER"
+	product_name "$ISO_PRODUCT_NAME"
+	bios_vendor "$ISO_BIOS_VENDOR"
+	# The verdict, both layers, with the reasons that produced it.
+	isolation_runtime "$ISOLATION_RUNTIME"
+	isolation_class "$ISOLATION_CLASS"
+	isolation_confidence "$ISOLATION_CONFIDENCE"
+	isolation_why "$ISOLATION_WHY"
+	machine_vmm "$MACHINE_VMM"
+	machine_confidence "$MACHINE_CONFIDENCE"
+	machine_score "$MACHINE_SCORE"
+	machine_runner_up_score "$MACHINE_RUNNER_UP"
+	container_runtime "$CONTAINER_RUNTIME"
+	container_confidence "$CONTAINER_CONFIDENCE"
+	container_score "$CONTAINER_SCORE"
+	container_runner_up_score "$CONTAINER_RUNNER_UP"
+	confidential_computing "$ISO_CC_TECH"
+	# Every signal the classifier scored, so the verdict can be audited — or redone — from the
+	# committed record without re-running the probe on hardware that may no longer exist. All are
+	# stable for a given machine shape, so identical sandboxes still fold to one host record.
+	acpi_oem "$ISO_ACPI_OEM"
+	acpi_oem_table "$ISO_ACPI_OEM_TABLE"
+	acpi_creator "$ISO_ACPI_CREATOR"
+	detected_virt "$ISO_VIRT"
+	detected_virt_vm "$ISO_VIRT_VM"
+	detected_virt_container "$ISO_VIRT_CONTAINER"
+	detected_virt_what "$ISO_VIRT_WHAT"
+	cpu_hypervisor "$ISO_CPU_HYPERVISOR"
+	hypervisor_flag "$ISO_HYPERVISOR_FLAG"
+	cpuinfo_flags "$ISO_CPUINFO_FLAGS"
+	cpu_is_uml "$ISO_CPU_IS_UML"
+	has_xen_node "$ISO_HAS_XEN_NODE"
+	has_vmbus "$ISO_HAS_VMBUS"
+	kernel_names_gvisor "$ISO_KERNEL_NAMES_GVISOR"
+	bootlog_names_gvisor "$ISO_BOOTLOG_NAMES_GVISOR"
+	virtio_devices "$ISO_VIRTIO_DEVICES"
+	virtio_transport "$ISO_VIRTIO_TRANSPORT"
+	pci_vendors "$ISO_PCI_VENDORS"
+	block_devices "$ISO_BLOCK_DEVICES"
+	net_ifaces "$ISO_NET_IFACES"
+	net_drivers "$ISO_NET_DRIVERS"
+	has_veth "$ISO_HAS_VETH"
+	root_fstype "$ISO_ROOT_FSTYPE"
+	mount_fstypes "$ISO_MOUNT_FSTYPES"
+	overlay_engine "$ISO_OVERLAY_ENGINE"
+	masked_proc "$ISO_MASKED_PROC"
+	kernel_cmdline_markers "$ISO_CMDLINE_MARKERS"
+	kernel_build "$ISO_KERNEL_BUILD"
+	has_smbios "$ISO_HAS_SMBIOS"
+	has_acpi "$ISO_HAS_ACPI"
+	has_hvc0 "$ISO_HAS_HVC0"
+	has_vsock "$ISO_HAS_VSOCK"
+	has_virtiofs "$ISO_HAS_VIRTIOFS"
+	has_kvm "$ISO_HAS_KVM"
+	has_fuse "$ISO_HAS_FUSE"
+	container_markers "$ISO_CONTAINER_MARKERS"
+	cgroup_engine "$ISO_CGROUP_ENGINE"
+	cgroup_root_writable "$ISO_CGROUP_RW"
+	userns_mapped "$ISO_USERNS_MAPPED"
+	cap_sys_admin "$ISO_CAP_SYS_ADMIN"
+	lsm_profile "$ISO_LSM_PROFILE"
+	# Docker-in-Docker capability.
+	dind_readiness "$DIND_READINESS"
+	dind_mode "$DIND_MODE"
+	dind_reasons "$DIND_REASONS"
+	docker_cli "$DIND_DOCKER_CLI"
+	dockerd_binary "$DIND_DOCKERD"
+	podman_binary "$DIND_PODMAN"
+	docker_socket "$DIND_SOCKET"
+	docker_reachable "$DIND_REACHABLE"
+	docker_server_version "$DIND_SERVER_VERSION"
+	docker_storage_driver "$DIND_STORAGE_DRIVER"
+	overlayfs_supported "$DIND_OVERLAYFS"
+	is_root "$DIND_IS_ROOT"
+)
+
+# jq builds the record wherever it exists, and it is the correct builder rather than the convenient
+# one: every value here is untrusted device text, and --arg passes each one out-of-band so jq escapes
+# it by construction. `$ARGS.named` collects those flags in order, so the key order matches the list
+# above — and the printf fallback's.
+#
+# The ranked candidate arrays attach only on the jq path, since building nested JSON by hand is
+# exactly the hazard the fallback exists to avoid; the fallback marks itself `degraded` so a consumer
+# can tell a jq-less sandbox from one where no candidate scored. The printf path cannot borrow jq's
+# safety: json_result validates with jq, so on a sandbox without it there is no parser to catch a bad
+# record either. What protects that path is _json_escape handling the control characters these
+# sources really emit (lib/bench.sh) — worth caring about because this artifact has real consumers,
+# packages/results/src/lib/host-metadata.ts flattening it into every Run's host metadata.
+if have jq; then
+	jq_args=()
+	for ((i = 0; i < ${#RECORD_FIELDS[@]}; i += 2)); do
+		jq_args+=(--arg "${RECORD_FIELDS[i]}" "${RECORD_FIELDS[i + 1]}")
+	done
+	# -c: one line, the shape the printf fallback emits and the shape this artifact has always had. A
+	# formatting difference between the two paths would be a difference between sandboxes, not
+	# between records.
+	jq -n -c "${jq_args[@]}" \
+		--arg machine_rows "$MACHINE_ROWS" --arg container_rows "$CONTAINER_ROWS" \
+		'def rows: split("\n") | map(select(length > 0) | split("\t")
+			| {id: .[1], score: (.[2] | tonumber), reasons: (.[3] | split("|"))});
+		 {schema_version: "'"$SCHEMA_VERSION"'"}
+		 # $ARGS.named collects EVERY named argument, so the two ranking tables would otherwise be
+		 # published twice: once parsed into the candidate arrays below, and once as the raw
+		 # tab-separated text they were parsed from.
+		 + ($ARGS.named | del(.machine_rows, .container_rows))
+		 + {machine_candidates: ($machine_rows | rows), container_candidates: ($container_rows | rows)}'
+else
+	{
+		printf '{"schema_version":"%s","degraded":"no-jq"' "$SCHEMA_VERSION"
+		for ((i = 0; i < ${#RECORD_FIELDS[@]}; i += 2)); do
+			printf ',"%s":"%s"' "${RECORD_FIELDS[i]}" "$(_json_escape "${RECORD_FIELDS[i + 1]}")"
+		done
+		printf '}\n'
+	}
+fi | json_result "$RESULT_NAME" || echo "(no structured provider record written)"
+
+echo ""
+echo "Structured result: ${RESULT_FILE}"

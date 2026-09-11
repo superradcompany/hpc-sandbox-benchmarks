@@ -1,153 +1,70 @@
+<div align="center">
+
 # High-Performance Sandbox Benchmarks
 
-Compare top sandbox providers on the same pinned machine shape for real developer and CI/CD workloads.
+**Compare top sandbox providers on the same target hardware shape for real developer and CI/CD workloads.**
 
-**Same target everywhere:** 4 vCPU · 8 GiB RAM · 40 GB disk. One headline metric per dimension, ranked with honest statistics.
+[Leaderboard](./LEADERBOARD.md) · [Methodology](./docs/methodology.md) · [Dataset](./data/dataset/) · [Architecture](./docs/architecture.md) · [Contributing](./CONTRIBUTING.md)
+
+4 vCPU · 8 GiB RAM · 40 GB disk
+
+<img src="docs/figures/realworld-better-auth.webp" width="960" alt="Better-Auth: 10 pipeline tasks across 8 environments, stacked by task and sorted fastest-first">
+
+</div>
+
 
 ## Why real-world workflows?
 
-Synthetic scores tell you what the hardware can do. We measure what developers actually
-experience — clone a repo, install dependencies, lint, build, test, etc.
-
+We measure the end-to-end time that developers and agents actually experience when using a sandbox to complete software engineering tasks. Going from a ticket to a PR is a multi-phase workflow - clone a repo, install dependencies, lint, build, test, etc. 
+ 
 A sandbox provider can top a creation time or CPU performance chart and still lose badly on:
 - dependency installation is thousands of small, random file writes, and a network-attached
 or bandwidth-capped disk turns that into the longest step of your run.
 - cloning a repo has the opposite profile: mostly sequential writes, bounded by network.
 - single-threaded developer tools are limited by single-thread CPU not threads
+- isolation technology and in-sandbox Docker capability
 
-## Start here
+## Why follow OpenBenchmarking for synthetics?
 
-| | |
-| --- | --- |
-| **[Leaderboard](./LEADERBOARD.md)** | Provider rankings from the latest published run |
-| **[Methodology](./docs/methodology.md)** | How a measurement is produced |
-| **[Docs hub](./docs/README.md)** | ADRs, CI secrets, security, contributing |
+Our synthetic benchmarks use versioned [Phoronix Test Suite](https://github.com/phoronix-test-suite/phoronix-test-suite) profiles published through [OpenBenchmarking.org](https://openbenchmarking.org/), the long-standing standard for Linux hardware and software benchmarking.
 
-Live provider benches and toolchain releases are **maintainer-only** (GitHub Environment `privileged`). Pull requests never receive provider secrets — see [CI & secrets](./docs/ci-secrets.md).
+Each workload has an inspectable definition for installation, arguments, repetition, parsing, units, and result direction, and can be reproduced independently outside this repository. The profiles are vendored, their metric definitions are generated rather than transcribed, and [CI rejects drift](./docs/adr/0003-generated-pts-catalog-and-drift-gate.md). Custom instrumentation is limited to measurements PTS cannot represent: provider lifecycle latency, sandbox capabilities, pricing, and complete developer workflows. Those workflows are authored as repo-local PTS profiles, so first-party workloads inherit the same execution and parsing model as upstream benchmarks.
 
----
+## Methodology
 
-## The repository
+Each result is produced from fresh, independently created sandboxes. Workloads, toolchains,
+arguments, and target resources are pinned; raw samples and observed machine properties are retained;
+normalized runs are schema-validated before publication.
 
-This repo is a **Bun workspace monorepo** with a strict, enforced dependency DAG and a uniform
-package shape. The guiding rule: *"can I import this?"* is answered by the path alone, and
-boundary violations fail CI.
+Within-sandbox passes and between-sandbox replicates are tracked separately. Failed, missing,
+unsupported, and resource-mismatched results are disclosed rather than treated as zero or silently
+excluded.
 
-## Source-first, no build step
+Read the full [methodology](./docs/methodology.md).
 
-Every package's `exports` map points at TypeScript **source** (`./src/index.ts`), and Bun resolves
-workspace sources natively. There is no compile step: `bun install` → `typecheck` → `test` →
-`lint` are all green with zero compilation. The committed `bun.lock` pins the whole graph.
+## Development
 
-## Layout
-
-```text
-packages/   importable libraries   — scope @sandbox-benchmarks/*
-  schema/       shared types + arktype schemas (bottom of the DAG)
-  providers/    provider adapters → schema + computesdk
-  templates/    per-provider template builders + toolchain Docker images (images/)
-  harness/      benchmark timing → providers + schema
-  results/      normalization → schema only (no provider SDKs)
-apps/
-  cli/          entrypoint with bin commands → all five packages
-tooling/        dev-only            — scope @repo/*
-  tsconfig/     shared source-first TS configs (config-only)
-  test-utils/   provider conformance suite factory
-  repo-checks/  boundary + package-meta invariant tests
-lib/        in-sandbox benchmark runner (bench.sh) + vendored PTS profiles
-data/       committed benchmark dataset (published run results)
-scripts/    maintainer scripts (dataset backfill, leaderboard update)
-docs/       methodology, ADRs, CI & secrets
+```bash
+mise install                     # pinned non-Bun tools (typos, shellcheck, hadolint)
+bun install --frozen-lockfile
+bun run typecheck
+bun run test
+bun run lint
 ```
 
-## Dependency DAG (enforced)
+The full command contract, workspace layout, and enforced dependency DAG are in
+[Architecture](./docs/architecture.md).
 
-| Member                      | Internal deps (`workspace:*`)                   | External (catalog)                  |
-|-----------------------------|-------------------------------------------------|-------------------------------------|
-| `@sandbox-benchmarks/schema`     | —                                               | `arktype`                           |
-| `@sandbox-benchmarks/providers`  | schema                                          | `arktype`, computesdk packages (`catalog:computesdk`) |
-| `@sandbox-benchmarks/templates`  | providers, schema                               | `computesdk` (`catalog:computesdk`) |
-| `@sandbox-benchmarks/harness`    | providers, schema                               | —                                   |
-| `@sandbox-benchmarks/results`    | schema                                          | `arktype`, XML tooling (`catalog:xml`) |
-| `@sandbox-benchmarks/cli` (app)  | schema, providers, templates, harness, results  | `dotenv`, `@actions/core`, provider SDKs (`catalog:computesdk`) |
-| `@repo/tsconfig`            | —                                               | —                                   |
-| `@repo/test-utils`          | schema                                          | —                                   |
-| `@repo/repo-checks`         | —                                               | —                                   |
+Provider benchmarks, dataset publication, and toolchain releases require protected credentials and
+run only from maintainer-controlled workflows; pull requests never receive provider secrets. See
+[CI & secrets](./docs/ci-secrets.md).
 
-`results` deliberately depends on `schema` alone among workspace packages — it must normalize
-without any provider SDK, and
-`@repo/repo-checks` enforces that no package reaches across boundaries or into another package's
-private `lib/`.
+## Contributing
 
-## Command contract
+Contributions must preserve three invariants:
 
-| Command              | What it does                                                            |
-|----------------------|-------------------------------------------------------------------------|
-| `bun install`        | Resolve the graph, symlink workspaces, install catalogs (≥7-day-old releases). |
-| `bun run typecheck`  | `tsc --noEmit` per member — proof of source-first/no-build.             |
-| `bun run test`       | `bun test` per member, including the repo-checks invariants.            |
-| `bun run lint`       | `biome check . --error-on-warnings` — CI gate; warnings fail (root-only Biome config). |
-| `bun run format`     | `biome format . --write` — formatting only (no import sorting / lint fixes). |
-| `bun run lint:fix`   | `biome check . --write` — formatting + import sorting + safe lint fixes. |
-| `bun run lint:fix:unsafe` | `biome check . --fix --unsafe` — also applies behavior-changing fixes; review the diff. |
-| `bun run spell`      | `typos` — source-code spell check (run it before pushing).              |
-| `bun run spell:fix`  | `typos --write-changes` — apply typos' suggested corrections.            |
-| `bun run lint:shell` | `shellcheck` on the repo's shell scripts (toolchain images, `lib/`, mise tasks). |
-| `bun run lint:docker`| `hadolint` on the toolchain-image Dockerfiles (`packages/templates/images`). |
-| `bun run smoke`      | Boot each provider's sandbox from the baked image and smoke-test it (providers without credentials are skipped). |
-| `bun run check:catalog-drift` | Fails if the generated PTS catalog drifted from the vendored profiles. |
+1. Every provider performs equivalent work.
+2. Every number is traceable to raw samples and exact workload provenance.
+3. Missing or non-comparable results remain visible.
 
-Run a single bin during development: `bun apps/cli/src/bin/plan-matrix.ts`.
-
-## Toolchain (mise)
-
-Non-Bun tools are version-pinned in [`mise.toml`](mise.toml) and managed with
-[mise](https://mise.jdx.dev): [`typos`](https://github.com/crate-ci/typos) (spell check),
-`shellcheck` + `hadolint` (shell/Dockerfile lint for the toolchain images), and
-`actionlint` + `zizmor` (workflow lint + security audit, run by the `ci-lint` workflow). After
-cloning, run `mise install` (and `mise trust` once) so the pinned binaries are available; the
-`bun run` wrappers invoke these tools through `mise exec`, so they always use the pinned versions.
-mise fetches from official release sources with checksum verification — no npm republisher and no
-install-time postinstall.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` runs the command contract on every pull request and every push to
-`main`: `bun install --frozen-lockfile --ignore-scripts` → `bun run lint` (the Biome gate) →
-`bun run lint:shell` → `bun run lint:docker` → `bun run typecheck` → `bun run test` →
-`bun run check:catalog-drift` → `bun run spell` (typos, set up via [mise](https://mise.jdx.dev)).
-A separate `ci-lint.yml` lints the workflows themselves (actionlint + zizmor). The same checks run
-locally, so green-on-your-machine means green-in-CI.
-
-CI runs on a maintainer-controlled runner, so it never executes fork-PR code — the gate runs only
-for pushes and same-repo pull requests. Anything that needs provider credentials additionally runs
-only from `main`, behind Environment [`privileged`](./docs/ci-secrets.md); pull requests never
-receive provider secrets.
-
-## Git hooks (pre-commit)
-
-[Lefthook](https://lefthook.dev) runs a fast local mirror of CI on every commit, configured in
-`lefthook.yml`:
-
-- **Biome** on staged files (`biome check --write`, restaging any auto-fixes; unfixable issues or
-  warnings block the commit).
-- **Typos** repo-wide (`bun run spell`) — read-only, so run `bun run spell:fix` to apply corrections.
-- **Lockfile** check (`bun install --frozen-lockfile`) when a manifest or `bun.lock` is staged, so
-  `package.json` and `bun.lock` can't drift apart.
-
-`bun install` wires the hooks automatically via the project's own `prepare` script
-(`lefthook install`) — no third-party postinstall runs. Re-install them with `bunx lefthook
-install`, and bypass a single commit with `LEFTHOOK=0 git commit`.
-
-## Supply-chain posture
-
-`bunfig.toml` sets `minimumReleaseAge = 604800` (7 days) so freshly published — possibly
-compromised — releases are not installed, and **no third-party lifecycle scripts run** (empty
-`trustedDependencies`). The git hooks above are wired by the project's own first-party `prepare`
-script, not a dependency's postinstall, and CI installs with `--ignore-scripts` so it runs none
-either. Lint and formatting are root-only via a single `biome.json`.
-
-## Community
-
-- [Contributing](./CONTRIBUTING.md) — local gate; how to add a provider, suite, or metric
-- [Security](./SECURITY.md) — vulnerability reporting; never paste secrets into issues or PRs
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md).

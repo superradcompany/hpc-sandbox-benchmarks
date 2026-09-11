@@ -1,9 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import type { GapCause, RawRun, ResultGap } from "@sandbox-benchmarks/schema";
 import { HARNESS_METRIC_IDS } from "@sandbox-benchmarks/schema";
 import { GapError } from "./gap-cause.ts";
 import type { LifecycleCompute, LifecycleSandbox } from "./lifecycle.ts";
 import { aggregateLifecycle, measureLifecycle } from "./lifecycle.ts";
+import { cleanupOwnedSandboxes } from "./sandbox-owner.ts";
 
 interface FakeCalls {
 	order: string[];
@@ -39,6 +40,7 @@ const noDelay = async (): Promise<void> => {};
 function fakeCompute(opts: FakeOptions = {}): { compute: LifecycleCompute; calls: FakeCalls } {
 	const calls: FakeCalls = { order: [], deletedSnapshots: [] };
 	let readinessProbes = 0;
+	let remainingDestroyFailures = opts.failDestroy ? 1 : 0;
 	const sandbox: LifecycleSandbox = {
 		sandboxId: "sb-1",
 		async runCommand(command) {
@@ -66,7 +68,10 @@ function fakeCompute(opts: FakeOptions = {}): { compute: LifecycleCompute; calls
 		},
 		async destroy() {
 			calls.order.push("destroy");
-			if (opts.failDestroy) throw new Error("destroy boom");
+			if (remainingDestroyFailures > 0) {
+				remainingDestroyFailures--;
+				throw new Error("destroy boom");
+			}
 			return undefined;
 		},
 	};
@@ -99,6 +104,10 @@ function fakeCompute(opts: FakeOptions = {}): { compute: LifecycleCompute; calls
 	}
 	return { compute, calls };
 }
+
+afterEach(async () => {
+	expect(await cleanupOwnedSandboxes()).toEqual([]);
+});
 
 /** Map of Metric id → number of Samples that carry it. */
 function countByOp(samples: RawRun[]): Record<string, number> {
@@ -236,7 +245,7 @@ describe("measureLifecycle", () => {
 		expect(calls.order).toContain("exec:uname -a");
 	});
 
-	it("records a skip (not a sample) when the SDK exposes no snapshot or list operation", async () => {
+	it("records a skip (not a sample) when the integration exposes no snapshot or list operation", async () => {
 		const { compute } = fakeCompute(); // no snapshot manager, no list
 		const { samples, gaps } = await measureLifecycle(compute, { provider: "modal" });
 
@@ -250,18 +259,18 @@ describe("measureLifecycle", () => {
 		expect(reasonFor(gaps, HARNESS_METRIC_IDS.controlPlaneList)).toMatch(
 			/no sandbox list operation/,
 		);
-		// The SDK exposes no such call, so neither was ever attempted — a skip, not an outage. And the
+		// The integration exposes no such call, so neither was attempted — a skip, not an outage. And the
 		// cause is `unsupported-operation`: a statement about the PROVIDER, the opposite half of the
 		// distinction `measurement-disabled` carries.
 		expect(outcomeFor(gaps, HARNESS_METRIC_IDS.snapshot)).toBe("skipped");
 		expect(outcomeFor(gaps, HARNESS_METRIC_IDS.controlPlaneList)).toBe("skipped");
 		expect(causeFor(gaps, HARNESS_METRIC_IDS.snapshot)).toEqual({
 			kind: "unsupported-operation",
-			detail: "provider SDK exposes no snapshot operation",
+			detail: "the provider integration under measurement exposes no snapshot operation",
 		});
 		expect(causeFor(gaps, HARNESS_METRIC_IDS.controlPlaneList)).toEqual({
 			kind: "unsupported-operation",
-			detail: "provider SDK exposes no sandbox list operation",
+			detail: "the provider integration under measurement exposes no sandbox list operation",
 		});
 	});
 

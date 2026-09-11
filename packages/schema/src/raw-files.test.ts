@@ -3,11 +3,18 @@ import type { ProviderRun, ResultGap } from "./index.ts";
 import {
 	aggregate,
 	harnessGapMarkerJson,
+	isProviderArtifactEvidenceFile,
 	isPtsForensicsFile,
 	isPtsResultFile,
 	isSkipMarkerFile,
 	parseGapMarker,
+	parseProviderArtifactEvidence,
+	parseProviderCostEvidence,
 	parseResultsArtifactName,
+	providerArtifactEvidenceFile,
+	providerArtifactEvidenceJson,
+	providerCostEvidenceFile,
+	providerCostEvidenceJson,
 	providerReportedNothing,
 	ptsForensicsFile,
 	resultsArtifactName,
@@ -15,6 +22,49 @@ import {
 } from "./index.ts";
 
 describe("raw-file naming", () => {
+	it("round-trips bounded host-owned artifact evidence with deterministic bytes", () => {
+		const record = {
+			cell: { runId: "run-1", providerId: "e2b", suite: "cpu-node" },
+			sandboxId: "sb-1",
+			provenance: {
+				source: "request-fallback" as const,
+				requested: { kind: "baked" as const, ref: "sandbox-benchmarks-toolchain-v8" },
+			},
+		} as const;
+		expect(providerArtifactEvidenceFile()).toBe("provider-artifact-evidence.json");
+		expect(isProviderArtifactEvidenceFile(providerArtifactEvidenceFile())).toBe(true);
+		expect(isProviderArtifactEvidenceFile("provider-cost-evidence.json")).toBe(false);
+		const bytes = providerArtifactEvidenceJson(record);
+		expect(bytes.endsWith("\n")).toBe(true);
+		expect(parseProviderArtifactEvidence(bytes)).toEqual(record);
+		expect(() => parseProviderArtifactEvidence(`{"padding":"${"x".repeat(17 * 1024)}"}`)).toThrow(
+			/exceeds 16 KiB/,
+		);
+	});
+
+	it("round-trips strict provider cost evidence with deterministic bytes", () => {
+		const record = {
+			kind: "missing" as const,
+			cell: { runId: "run-1", providerId: "modal-gvisor", suite: "cpu-node" },
+			subject: { kind: "sandbox" as const, sandboxId: "sb-1" },
+			capturedAt: "2026-08-08T00:00:00.000Z",
+			sdk: { packageName: "modal", version: "0.7.6" },
+			reason: "unsupported_public_api" as const,
+			detail: "No public sandbox usage endpoint.",
+		} as const;
+		expect(providerCostEvidenceFile()).toBe("provider-cost-evidence.json");
+		const bytes = providerCostEvidenceJson(record);
+		expect(bytes.endsWith("\n")).toBe(true);
+		expect(parseProviderCostEvidence(bytes)).toEqual(record);
+		expect(() => parseProviderCostEvidence({ ...record, reason: "unknown" })).toThrow(
+			/invalid provider cost evidence/,
+		);
+	});
+	it("rejects an oversized evidence file before parsing JSON", () => {
+		expect(() => parseProviderCostEvidence(`{"padding":"${"x".repeat(97 * 1024)}"}`)).toThrow(
+			/exceeds 96 KiB/,
+		);
+	});
 	it("recognises PTS result XML by prefix and extension", () => {
 		expect(isPtsResultFile("pts_node-web-tooling.xml")).toBe(true);
 		expect(isPtsResultFile("pts_node-web-tooling.log")).toBe(false);
@@ -342,6 +392,45 @@ describe("providerReportedNothing", () => {
 			providerReportedNothing({
 				...empty(),
 				hostMetadata: [{ source: "mise/system-provider", sourceFile: "s.json", fields: [] }],
+			}),
+		).toBe(false);
+		// A booted sandbox leaves an artifact attribution even when it produced nothing else, so a
+		// provider that has one is not a never-dispatched row. `costEvidence` counted already but was
+		// never asserted here, which left this test's "EACH" claim untrue for both sandbox-scoped
+		// arrays.
+		expect(
+			providerReportedNothing({
+				...empty(),
+				artifactEvidence: [
+					{
+						cell: {
+							runId: "run-1",
+							providerId: "modal-vm",
+							suite: "cpu-node",
+						},
+						sandboxId: "isandbox",
+						provenance: {
+							source: "request-fallback",
+							requested: { kind: "baked", ref: "toolchain-v8" },
+						},
+					},
+				],
+			}),
+		).toBe(false);
+		expect(
+			providerReportedNothing({
+				...empty(),
+				costEvidence: [
+					{
+						kind: "missing",
+						cell: { runId: "run-1", providerId: "modal-vm", suite: "cpu-node" },
+						subject: { kind: "sandbox", sandboxId: "sb-1" },
+						capturedAt: "2026-06-20T00:00:00.000Z",
+						sdk: { packageName: "modal", version: "0.9.0" },
+						reason: "sandbox_teardown_unconfirmed",
+						detail: "teardown was not confirmed",
+					},
+				],
 			}),
 		).toBe(false);
 	});

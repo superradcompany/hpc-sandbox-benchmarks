@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { PROVIDERS, SUITE_NAMES } from "@sandbox-benchmarks/schema";
-import { formatDuration, HELP, parseReplicateFlag } from "./bench-suite.ts";
+import { formatDuration, HELP, parseReplicateFlag, runtimeUserSummary } from "./bench-suite.ts";
 
 /** The ids `runSuite` actually matches on: it compares against the schema-joined adapter names
  *  EXACTLY, so `LEGACY_PROVIDER_ALIASES` ("daytona", "modal") does not rescue a copied example.
@@ -93,5 +93,26 @@ describe("formatDuration", () => {
 	// 59.6s rounds to 60 seconds, which must not render as "0m60s".
 	it("carries a rounded-up 60th second into the minute", () => {
 		expect(formatDuration(59_600)).toBe("1m00s");
+	});
+});
+
+describe("runtimeUserSummary", () => {
+	it("keeps a root-by-contract provider quiet and flags any other identity", () => {
+		expect(runtimeUserSummary("e2b", "root")).toBe("root");
+		expect(runtimeUserSummary("e2b", "user")).toBe("⚠ user (expected root)");
+		expect(runtimeUserSummary("e2b", undefined)).toBe("—");
+	});
+
+	// Runloop's lane runs unprivileged by design. Flagging that would put a warning on all twelve
+	// replicates of a healthy run — the noise that teaches readers to skip the column entirely.
+	it("stays quiet for a provider that declares an unprivileged runtime identity", () => {
+		expect(runtimeUserSummary("runloop", "user")).toBe("user");
+		expect(runtimeUserSummary("runloop", "sandbox")).toBe("sandbox");
+	});
+
+	// The other direction is drift too: a provider that silently gained root changed the security
+	// posture the isolation notes describe, and setup would start writing root-owned state.
+	it("flags root where an unprivileged identity was declared", () => {
+		expect(runtimeUserSummary("runloop", "root")).toBe("⚠ root (expected unprivileged)");
 	});
 });

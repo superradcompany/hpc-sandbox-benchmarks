@@ -1,33 +1,72 @@
 // Provider identity & economics — the static facts the comparison surfaces next to results:
 // isolation technology, pricing model, maturity, and whether the SDK can pin a target spec.
-// This is the SINGLE owner of Provider identity (`id`, `requiredEnvVars`); the harness adapter
-// in @sandbox-benchmarks/providers joins against it by id and refuses any one-sided provider.
+// Provider identity itself lives in the dependency-free `provider-ids.ts` leaf; this registry owns
+// the metadata keyed by that identity. The harness adapter joins against it and refuses any
+// one-sided provider.
 //
 // Validation status is deliberately NOT declared here: a provider is "validated" exactly when a
 // committed run carries real metrics for it (computed downstream), "pending" otherwise.
+
+import type { ProviderId } from "./provider-ids.ts";
+import { PROVIDER_IDS } from "./provider-ids.ts";
+import { REGISTRY } from "./provider-meta/index.ts";
+import type {
+	NormalizedProviderInput,
+	ProviderArtifact,
+	ProviderMetaSource,
+	ProviderPreAuth,
+	ProviderRunnerPolicy,
+} from "./provider-meta.ts";
+import { normalizeProviderInput } from "./provider-meta.ts";
+import type { PricingComponent, PricingQuantityTerm, ProviderPricing } from "./provider-pricing.ts";
+
+export type { ArtifactPhase, BaseImageUse } from "./provider-artifacts.ts";
+export {
+	bakedArtifactName,
+	baseImageUse,
+	isBakedProviderId,
+	isMirroredProviderId,
+} from "./provider-artifacts.ts";
+export type { ProviderId } from "./provider-ids.ts";
+export { PROVIDER_IDS } from "./provider-ids.ts";
+export type {
+	BakedProviderId,
+	BuiltProviderId,
+	ImageProviderId,
+	MirroredProviderId,
+	StockProviderId,
+} from "./provider-meta/index.ts";
+export { REGISTRY } from "./provider-meta/index.ts";
+export type {
+	IsolationClass,
+	NormalizedProviderInput,
+	ProviderArtifact,
+	ProviderInput,
+	ProviderInputDescriptor,
+	ProviderInputSource,
+	ProviderPreAuth,
+	ProviderRunnerPolicy,
+} from "./provider-meta.ts";
+export { PROVIDER_PRE_AUTH_CONTRACTS, PROVIDER_PRE_AUTH_POLICIES } from "./provider-meta.ts";
+export * from "./provider-pricing.ts";
+
+import type { TargetSpec } from "./target-spec.ts";
+import { TARGET_SPEC } from "./target-spec.ts";
+
+export type { TargetSpec } from "./target-spec.ts";
+export { TARGET_SPEC } from "./target-spec.ts";
 
 /**
  * Canonical provider ids — the single vocabulary every registry joins on. Adding an id forces a
  * matching {@link REGISTRY} entry (the Record type below makes a missing or extra id a compile
  * error) and, downstream, a harness adapter in @sandbox-benchmarks/providers.
  */
-export type ProviderId =
-	| "e2b"
-	| "daytona-vm"
-	| "daytona-container"
-	| "modal-gvisor"
-	| "modal-vm"
-	| "blaxel"
-	| "microsandbox-local"
-	| "microsandbox-cloud"
-	| "novita"
-	| "namespace";
 
 /** Can the SDK request a pinned target spec (vCPU / memory) at create() time? */
 export type SpecPinning = "settable" | "fixed" | "unknown";
 
 /**
- * How a provider's command-exec transport behaves *through its `@computesdk/*` adapter* — the facts the
+ * How a provider's command-exec transport behaves *through its ComputeSDK adapter* — the facts the
  * harness needs to pick a per-step transport instead of hardcoding one provider's quirks (the original
  * sin this models away: the harness forced Daytona's detached+poll on every provider). Owned here
  * alongside the other declared capabilities ({@link SpecPinning}, isolation, maturity) because it is a
@@ -37,12 +76,14 @@ export type SpecPinning = "settable" | "fixed" | "unknown";
  * Three independent capabilities, each load-bearing for transport selection:
  *
  *   - `streaming` — does the adapter deliver stdout/stderr incrementally (computesdk's
- *     `onStdout`/`onStderr`)? All three shipped adapters drop those callbacks, so a long synchronous
- *     exec buffers silently. Modeled because a streaming path keeps a connection productive past an
- *     idle gateway cap; today it is uniformly `false`, so it does not yet tip the harness's choice.
- *   - `syncCapMs` — the longest a single *synchronous* exec round-trip is safe before the provider
- *     caps it, or `null` when uncapped. The conservative policy bound the harness compares a step's
- *     timeout budget against: a step that could run past it must not go synchronous. Daytona returns a
+ *     `onStdout`/`onStderr`)? Most shipped adapters drop those callbacks, so a long synchronous exec
+ *     buffers silently; run.cloud's native SDK adapter passes them through. Modeled because a streaming
+ *     path keeps a connection productive past an idle gateway cap.
+ *   - `syncCapMs` — the configured durability threshold for a single *synchronous* exec round-trip,
+ *     or `null` when validated as uncapped. It may encode a vendor-enforced limit or a conservative
+ *     repository policy where long-lived synchronous transport has not been validated. The harness
+ *     compares each step's timeout budget against it: a step that could reach it must not go
+ *     synchronous. Daytona returns a
  *     server-side HTTP 408 on multi-minute synchronous execs while the process keeps running
  *     (`docs/evidence/daytona-exec-transport.md`); E2B's `commands.run` defaults to a 60s command
  *     timeout the computesdk wrapper never overrides.
@@ -58,7 +99,7 @@ export type SpecPinning = "settable" | "fixed" | "unknown";
  *     later exec, it can detach.
  */
 export interface ProviderTransport {
-	/** Does the `@computesdk/*` adapter stream stdout/stderr chunks (`onStdout`/`onStderr`)? */
+	/** Does the ComputeSDK adapter stream stdout/stderr chunks (`onStdout`/`onStderr`)? */
 	streaming: boolean;
 	/** Conservative bound (ms) on a safe single synchronous exec round-trip; `null` when uncapped. */
 	syncCapMs: number | null;
@@ -67,40 +108,12 @@ export interface ProviderTransport {
 	detachedPoll: boolean;
 }
 
-/**
- * How a provider bills. A discriminated union so a vetted `per_vcpu_hour` rate cannot be declared
- * without its `usdPerVcpuHour` — the missing-rate case is a compile error, not a silent `null`.
- */
-export type ProviderPricing =
-	| {
-			model: "per_vcpu_hour";
-			/** USD per vCPU-hour at the pinned target spec. */
-			usdPerVcpuHour: number;
-			/** USD per GiB of memory per hour, when memory is billed separately. */
-			usdPerGibHour?: number;
-			/** Memory (GiB) billed at $0 before {@link usdPerGibHour} applies, e.g. Daytona's first 5 GiB. */
-			includedMemoryGb?: number;
-			/**
-			 * USD per GiB of disk per hour at the pinned target spec. `0` means free at that spec
-			 * (e.g. within a free tier); omitted entirely when the provider publishes no overage rate.
-			 * Recorded for display only — deliberately excluded from {@link hourlyCostAtTargetSpec} so
-			 * an unpublished disk rate can't bias the ranking.
-			 */
-			usdPerGibDiskHour?: number;
-			notes: string;
-			sourceUrl?: string;
-	  }
-	| {
-			/** No vetted rate in repo config; {@link hourlyCostAtTargetSpec} returns `null`. */
-			model: "unknown";
-			notes: string;
-			sourceUrl?: string;
-	  };
-
 /** Isolation technology a provider runs sandboxes under. */
 export interface ProviderIsolation {
 	/** e.g. "Firecracker microVM", "gVisor container", "unknown". */
 	technology: string;
+	/** Stable declared class used by figures and normalization; never inferred from display text. */
+	class: "microVM" | "container" | "userspace" | "unknown";
 	notes?: string;
 }
 
@@ -110,15 +123,32 @@ export interface ProviderMaturity {
 	notes?: string;
 }
 
+/**
+ * Which identity a provider's benchmark lane runs as INSIDE the sandbox.
+ *
+ * `"unprivileged"` deliberately does not name the user: the point is the privilege level, which is
+ * what the toolchain has to accommodate (separate PTS state, no writes to root-owned trees). The
+ * account name is the provider's business and has changed without notice.
+ */
+export type ProviderRuntimeIdentity = "root" | "unprivileged";
+
 /** The static description of a sandbox provider, owned by the schema. */
 export interface ProviderMeta {
 	/** Stable identifier joined against the harness adapter map; one of {@link ProviderId}. */
 	id: ProviderId;
 	displayName: string;
+	/** Stable vendor label shared by isolation variants. */
+	vendor: string;
+	/** The account whose quota this provider consumes; see {@link quotaDomain}. */
+	quotaDomain: string;
 	website: string;
 	/** The npm package the harness adapter wraps, e.g. "@computesdk/e2b". */
 	sdkPackage: string;
-	/** Credentials the harness needs; any missing one produces a skip marker. */
+	/** Artifact lifecycle declared independently of vendor API syntax. */
+	artifact: ProviderArtifact;
+	/** Normalized provider inputs; consumers never handle descriptor shorthand. */
+	inputs: readonly NormalizedProviderInput[];
+	/** Compatibility view for the current harness; derived from required inputs. */
 	requiredEnvVars: string[];
 	isolation: ProviderIsolation;
 	pricing: ProviderPricing;
@@ -126,6 +156,21 @@ export interface ProviderMeta {
 	specPinning: SpecPinning;
 	/** How the provider's exec transport behaves — the harness selects sync vs detached from this. */
 	transport: ProviderTransport;
+	/** Optional GitHub runner route plus its coupled setup-cache and reaping-budget policy. */
+	runner?: ProviderRunnerPolicy;
+	/** Optional CI authentication preparation owned by generated wiring. */
+	preAuth?: ProviderPreAuth;
+	/**
+	 * Identity the benchmark lane runs as in-sandbox. Omitted means `"root"`: setup, the baked PTS
+	 * state and every adapter target root, and the providers that DO inject an unprivileged user are
+	 * the exception worth declaring — e2b and novita each pin their exec back to root explicitly
+	 * (e2b-root.ts), so only a provider with no such lever is `"unprivileged"`.
+	 *
+	 * This exists so the job summary flags DRIFT rather than a supported configuration: a hardcoded
+	 * "expected root" marks every Runloop replicate anomalous on a perfectly healthy run, which trains
+	 * readers to ignore the warning that was added to catch a real identity change.
+	 */
+	runtimeIdentity?: ProviderRuntimeIdentity;
 }
 
 /**
@@ -147,395 +192,12 @@ export interface ProviderMeta {
  * so it clears the gate anyway. Blaxel's sandbox root is a RAM-derived tmpfs with no independent disk
  * knob, so it mounts a 40 GiB volume at the PTS data dir where the heavy suites write (see
  * packages/providers/src/lib/blaxel-volume.ts) — clearing the gate like the others. Only e2b/novita
- * (the `@e2b/cli` `template create` takes only `--cpu-count`/`--memory-mb`) and namespace
- * (`NamespaceConfig` has no disk field at all) still CANNOT express disk:
+ * (the `@e2b/cli` `template create` takes only `--cpu-count`/`--memory-mb`), namespace
+ * (`NamespaceConfig` has no disk field at all), and Vercel (resources exposes only vCPUs) still
+ * CANNOT express disk:
  * they run with actuals recorded and the heavy suites skip there, surfaced as an explicit coverage gap
  * in the leaderboard, never silently dropped.
  */
-export const TARGET_SPEC = { vcpus: 4, memoryGb: 8, diskGb: 40 } as const;
-
-// Per-vendor pricing/transport, hoisted to one const per vendor ahead of the isolation-variant
-// fan-out later in this stack (Daytona → VM + container; Modal → gVisor + VM). A vendor bills one
-// way and its `@computesdk/*` adapter execs one way regardless of which isolation a sandbox uses, so
-// hoisting these lets a vendor's variant entries share one const instead of each carrying its own —
-// making it impossible for their rates or transport bounds to drift apart.
-
-/** Daytona's published billing, shared by its isolation variants. */
-const daytonaPricing: ProviderPricing = {
-	model: "per_vcpu_hour",
-	// $0.000014/vCPU-s × 3600 = $0.0504/vCPU-hr; $0.0000045/GiB-s × 3600 = $0.0162/GiB-hr.
-	usdPerVcpuHour: 0.0504,
-	usdPerGibHour: 0.0162,
-	// First 5 GiB of memory ship free, so only the remainder is billed at the target spec.
-	includedMemoryGb: 5,
-	// $0.00000003/GiB-s × 3600 = $0.000108/GiB-hr (first 5 GiB free).
-	usdPerGibDiskHour: 0.000108,
-	notes:
-		"Published per-second rates (exact): $0.000014/vCPU-s, $0.0000045/GiB-s (first 5 GiB memory free). Disk $0.00000003/GiB-s (first 5 GiB free).",
-	sourceUrl: "https://www.daytona.io/pricing",
-};
-
-/** Daytona's exec transport, shared by its isolation variants. */
-const daytonaTransport: ProviderTransport = {
-	// The single-round-trip-capped reference case: the Daytona server returns HTTP 408 on a
-	// multi-minute synchronous `executeCommand` while the process keeps running server-side, and
-	// `@computesdk/daytona` ignores onStdout/onStderr (hardcoding `stderr:""`) — no streaming to
-	// keep the connection productive. See docs/evidence/daytona-exec-transport.md. The exact
-	// server threshold is unmeasured (sub-second probes succeed; multi-minute execs 408), so the
-	// bound is a conservative 60s policy: budget anything longer to the detached+poll path
-	// (`background` via nohup + the pollable filesystem).
-	streaming: false,
-	syncCapMs: 60_000,
-	detachedPoll: true,
-};
-
-/** Modal's published billing, shared by its isolation variants. */
-const modalPricing: ProviderPricing = {
-	model: "per_vcpu_hour",
-	// Sandbox non-preemptible rates. CPU: $0.00003942/requested-cpu-s × 3600 = $0.141912/vCPU-hr —
-	// a requested `cpu` unit delivers one schedulable vCPU (measured; see the harness adapter), so
-	// the docs' "physical core" rate is billed per vCPU-equivalent and gets no ÷2 normalization.
-	// Memory: $0.00000672/GiB-s × 3600 = $0.024192/GiB-hr.
-	usdPerVcpuHour: 0.141912,
-	usdPerGibHour: 0.024192,
-	// Volumes: 1 TiB/mo free, then $0.09/GiB/mo. The 40 GB target spec sits inside the free
-	// tier, so the marginal disk rate at TARGET_SPEC is 0 (known, not unknown).
-	usdPerGibDiskHour: 0,
-	notes:
-		"Sandbox non-preemptible rates (exact): CPU $0.00003942/s per requested cpu unit (observed to deliver 1 schedulable vCPU each, despite the docs calling it a physical core), memory $0.00000672/GiB-s. Regional multipliers (1.25×–2.5×) compound. Volumes: 1 TiB/mo free, then $0.09/GiB/mo.",
-	sourceUrl: "https://modal.com/pricing",
-};
-
-/** Modal's exec transport, shared by its isolation variants. */
-const modalTransport: ProviderTransport = {
-	// `@computesdk/modal` runs `sandbox.exec([...])` and `process.wait()`s the result, with no
-	// separate per-exec timeout. There is no hard server gateway cap, but the exec stdio stream
-	// is not reliable over benchmark-length execs: a ~66-minute better-auth run completed
-	// in-sandbox (manifest exit_code 0) while the harness-side stream died with gRPC INTERNAL
-	// "Failed to read exec stdio stream" (ZEHA3277, 2026-07-10), losing the step result. Cap
-	// synchronous execs at 30 minutes so suite-length steps take the detached+poll path, which
-	// survives a dropped stream; short setup steps keep the cheaper direct exec.
-	streaming: false,
-	syncCapMs: 30 * 60_000,
-	detachedPoll: true,
-};
-
-/**
- * The registry, keyed by {@link ProviderId} — the inspiration is the harness adapter map, which
- * keys the *behavioural* half of a provider the same way. A keyed Record (rather than an array of
- * objects each repeating its `id`) buys three things for free: ids are unique by construction, the
- * `Record<ProviderId, …>` type forces exactly one entry per id, and the `id` is attached from the
- * key when the array form is built so it can never drift from its key.
- *
- * Pricing is normalized to USD per vCPU-hour and per GiB-hour from each provider's published
- * per-second rates (see each entry's sourceUrl), cross-checked against the computesdk benchmark
- * pricing table: https://github.com/computesdk/benchmarks/blob/master/pricing.json
- * Disk is recorded per entry (`usdPerGibDiskHour`) but excluded from {@link hourlyCostAtTargetSpec},
- * since overage rates are not uniformly published (E2B publishes none; Modal is free under its
- * 1 TiB/mo tier) and a missing rate would otherwise read as free. Egress is omitted entirely.
- */
-const REGISTRY: Record<ProviderId, Omit<ProviderMeta, "id">> = {
-	e2b: {
-		displayName: "E2B",
-		website: "https://e2b.dev",
-		sdkPackage: "@computesdk/e2b",
-		requiredEnvVars: ["E2B_API_KEY"],
-		isolation: { technology: "Firecracker microVM" },
-		pricing: {
-			model: "per_vcpu_hour",
-			// $0.000014/vCPU-s × 3600 = $0.0504/vCPU-hr; $0.0000045/GiB-s × 3600 = $0.0162/GiB-hr.
-			usdPerVcpuHour: 0.0504,
-			usdPerGibHour: 0.0162,
-			notes:
-				"Published per-second rates (exact): $0.000014/vCPU-s, $0.0000045/GiB-s. Storage 10 GiB included (20 on Pro); no published overage rate.",
-			sourceUrl: "https://e2b.dev/pricing",
-		},
-		maturity: { status: "ga", notes: "Custom images via e2b template build." },
-		specPinning: "fixed",
-		transport: {
-			// `@computesdk/e2b` calls `sandbox.commands.run(cmd)` with no options, so the E2B SDK applies
-			// its default 60s command timeout (`Commands.defaultProcessConnectionTimeout = 6e4`) and the
-			// onStdout/onStderr callbacks are never passed through. A step budgeted past ~60s must detach;
-			// E2B exposes a filesystem + `background`, so detached+poll is available.
-			streaming: false,
-			syncCapMs: 60_000,
-			detachedPoll: true,
-		},
-	},
-	"daytona-vm": {
-		displayName: "Daytona (VM)",
-		website: "https://daytona.io",
-		sdkPackage: "@computesdk/daytona",
-		requiredEnvVars: ["DAYTONA_API_KEY"],
-		isolation: {
-			technology: "microVM (Linux VM)",
-			notes:
-				"Boots a snapshot baked with SandboxClass.LINUX_VM on Daytona's Linux-VM runners (region us-west-2, via DAYTONA_TARGET). Snapshot-based images; orgs locked to a dedicated region need their own snapshot (DAYTONA_SNAPSHOT). The prior single `daytona` entry mislabeled this as a container — the baked class has always been a microVM.",
-		},
-		pricing: daytonaPricing,
-		maturity: {
-			status: "ga",
-			notes: "The validated reference provider for this harness (pre-baked toolchain snapshot).",
-		},
-		specPinning: "settable",
-		transport: daytonaTransport,
-	},
-	"daytona-container": {
-		displayName: "Daytona (container)",
-		website: "https://daytona.io",
-		sdkPackage: "@computesdk/daytona",
-		requiredEnvVars: ["DAYTONA_API_KEY"],
-		isolation: {
-			technology: "container (Sysbox/OCI)",
-			notes:
-				"Boots its own snapshot baked with SandboxClass.CONTAINER on Daytona's container runners in region `us` (Daytona's default class uses Sysbox-based OCI containers, not gVisor). Separate snapshot from daytona-vm because the sandbox class is fixed at snapshot-bake time, not per-create.",
-		},
-		pricing: daytonaPricing,
-		maturity: {
-			status: "beta",
-			notes:
-				"New isolation variant sharing Daytona credentials/pricing with daytona-vm; boots a container-class snapshot in region `us`. Not yet a committed run.",
-		},
-		specPinning: "settable",
-		transport: daytonaTransport,
-	},
-	blaxel: {
-		displayName: "Blaxel",
-		website: "https://blaxel.ai",
-		sdkPackage: "@computesdk/blaxel",
-		requiredEnvVars: ["BL_API_KEY", "BL_WORKSPACE"],
-		isolation: {
-			technology: "microVM",
-			notes:
-				"Blaxel sandboxes (sub-25ms boot claim). CPU is COUPLED to RAM (measured: cores = memory MB / 2048) with no cgroup cpu.max, and the sandbox root is a RAM-overlay tmpfs with no independent disk knob (storageMb/diskPercent are accepted but silently ignored on this plan). The adapter pins memory=8192 -> 8 GiB RAM and 4 vCPU (specMatched=true covers that effective vCPU/memory pair only), and mounts a 40 GiB volume at the PTS data dir so the separate disk gate clears (see blaxel-volume.ts). The target's vCPU is 4 precisely so Blaxel's coupled point lands on-spec — the dimensions stay coupled, so a different target shape would put Blaxel off-spec again.",
-		},
-		pricing: {
-			model: "unknown",
-			notes: "Not yet vetted against a published per-second rate.",
-			sourceUrl: "https://blaxel.ai/pricing",
-		},
-		maturity: {
-			status: "beta",
-			notes:
-				"Now carries committed runs and is in the default matrix set. memory=8192 hits the 4 vCPU / 8 GiB target (specMatched=true is that vCPU/memory check only); the 40 GiB volume (mounted at the PTS data dir) separately lets the realworld suites (mastra 30, openclaw 25) clear the disk gate instead of skipping.",
-		},
-		// memory=8192 lands on the target's 8 GiB / 4 vCPU point because the target's vCPU was chosen to
-		// sit on Blaxel's RAM/CPU coupling curve (specMatched only judges that pair). The 40 GiB volume
-		// is the separate disk-gate path, not part of specMatched. The dimensions are still coupled --
-		// you can't set CPU and RAM independently -- so "fixed" remains the honest capability: this
-		// particular target is reachable, an arbitrary one would not be.
-		specPinning: "fixed",
-		transport: {
-			// `@computesdk/blaxel` execs through the sandbox gateway; long synchronous execs are not
-			// validated, so apply the conservative 60s policy bound and use the detached+poll path
-			// (background nohup + pollable filesystem, both supported by the wrapper) for long steps.
-			streaming: false,
-			syncCapMs: 60_000,
-			detachedPoll: true,
-		},
-	},
-	"microsandbox-local": {
-		displayName: "Microsandbox (local)",
-		website: "https://microsandbox.dev",
-		sdkPackage: "microsandbox",
-		// This is an explicit capability opt-in rather than a credential. Local runs require a host
-		// with KVM on Linux or Hypervisor.framework on macOS and should skip everywhere else.
-		requiredEnvVars: ["MICROSANDBOX_LOCAL_BENCH"],
-		isolation: {
-			technology: "libkrun microVM (local)",
-			notes:
-				"Runs on the benchmark harness machine itself with no control-plane or network hop. Results measure that host's hardware and are identified separately from Microsandbox Cloud.",
-		},
-		pricing: {
-			model: "unknown",
-			notes:
-				"Self-hosted execution has no vendor compute rate; infrastructure cost depends on the machine running the harness.",
-			sourceUrl: "https://microsandbox.dev",
-		},
-		maturity: {
-			status: "beta",
-			notes:
-				"Direct SDK adapter with exec, filesystem, lifecycle, list, and local snapshots. Opt-in until a comparable committed run exists.",
-		},
-		specPinning: "settable",
-		transport: {
-			// Streaming callbacks are not adapted, but background exec plus the agent filesystem provides
-			// the durable detached+poll path. `syncCapMs` is a real number, not null, precisely so that
-			// path is reachable: `selectTransport` short-circuits a null cap to "sync" REGARDLESS of
-			// `detachedPoll`, which would leave every benchmark-length step as one synchronous exec whose
-			// output exists only in the agent response — nothing to read back if that exec drops. Native
-			// in-process control has no gateway timeout, so this cap is a durability policy rather than a
-			// vendor limit; it matches the cloud variant so both backends detach at the same boundary.
-			streaming: false,
-			syncCapMs: 60_000,
-			detachedPoll: true,
-		},
-	},
-	"microsandbox-cloud": {
-		displayName: "Microsandbox Cloud",
-		website: "https://microsandbox.dev",
-		sdkPackage: "microsandbox",
-		// MSB_API_URL is only an override for staging/private deployments. The SDK defaults to
-		// api.microsandbox.dev, so the key alone is the cloud-selection and credential gate.
-		requiredEnvVars: ["MSB_API_KEY"],
-		isolation: {
-			technology: "libkrun microVM (cloud)",
-			notes:
-				"The Microsandbox SDK talks to msb-cloud; Nomad schedules the same libkrun microVM runtime on remote hosts. Kept distinct from local runs so datasets never mix host-local and cloud measurements.",
-		},
-		pricing: {
-			model: "unknown",
-			notes:
-				"Cloud pricing is not public yet; no economics are emitted until a stable product rate is published.",
-			sourceUrl: "https://microsandbox.dev",
-		},
-		maturity: {
-			status: "beta",
-			notes:
-				"Create, readiness, exec, filesystem, list, and graceful teardown are supported. Cloud snapshots and published ports are not yet available.",
-		},
-		specPinning: "settable",
-		transport: {
-			// The adapter does not expose streaming callbacks. Use detached+filesystem polling for any
-			// benchmark-length step so a long-lived remote WebSocket is not the durability boundary.
-			streaming: false,
-			syncCapMs: 60_000,
-			detachedPoll: true,
-		},
-	},
-	"modal-gvisor": {
-		displayName: "Modal (gVisor)",
-		website: "https://modal.com",
-		sdkPackage: "@computesdk/modal",
-		requiredEnvVars: ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"],
-		isolation: {
-			technology: "gVisor container",
-			notes:
-				"Modal's default sandbox runtime. scalableSandboxes enabled in the harness; nproc tracks the requested cpu 1:1.",
-		},
-		pricing: modalPricing,
-		maturity: { status: "ga", notes: "scalableSandboxes enabled in the harness." },
-		specPinning: "settable",
-		transport: modalTransport,
-	},
-	"modal-vm": {
-		displayName: "Modal (VM)",
-		website: "https://modal.com",
-		sdkPackage: "@computesdk/modal",
-		requiredEnvVars: ["MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"],
-		isolation: {
-			technology: "microVM (VM runtime)",
-			notes:
-				"Modal's experimental VM runtime — a gVisor-free KVM microVM, selected per-create via experimentalOptions {vm_runtime:true} (no separate image; same pushed toolchain image as modal-gvisor).",
-		},
-		pricing: modalPricing,
-		maturity: {
-			status: "beta",
-			notes:
-				"Isolation variant sharing Modal credentials/pricing with modal-gvisor; adds experimentalOptions {vm_runtime:true} at create. Now carries committed runs and is in the default matrix set.",
-		},
-		specPinning: "settable",
-		transport: modalTransport,
-	},
-	novita: {
-		displayName: "Novita",
-		website: "https://novita.ai/sandbox",
-		// Novita's control plane speaks the E2B protocol, so the harness drives it through the e2b
-		// wrapper with its connection methods backed by novita-sandbox (Novita's fork of the e2b SDK)
-		// — see the novita adapter's compat module.
-		sdkPackage: "@computesdk/e2b",
-		requiredEnvVars: ["NOVITA_API_KEY"],
-		isolation: {
-			technology: "microVM",
-			notes:
-				"Dedicated microVM per sandbox; E2B-protocol-compatible control plane (us-phx-1.sandbox.novita.ai) driven through @computesdk/e2b with novita-sandbox-backed connection methods.",
-		},
-		pricing: {
-			model: "per_vcpu_hour",
-			// $0.0000098/vCPU-s × 3600 = $0.03528/vCPU-hr; $0.0000032/GiB-s × 3600 = $0.01152/GiB-hr.
-			usdPerVcpuHour: 0.03528,
-			usdPerGibHour: 0.01152,
-			// Storage $0.00009/GB-hr with the first 60 GB free — the 40 GB target spec sits inside the
-			// free tier, so the marginal disk rate at TARGET_SPEC is 0 (known, not unknown).
-			usdPerGibDiskHour: 0,
-			notes:
-				"Published per-second rates (exact): $0.0000098/vCPU-s, $0.0000032/GiB-s. Storage $0.00009/GB-hr (first 60 GB free).",
-			sourceUrl: "https://novita.ai/sandbox",
-		},
-		maturity: {
-			status: "beta",
-			notes:
-				"E2B-compatible API; boots the pre-baked toolchain template created on Novita's control plane by the bake pipeline (novita-sandbox Template.build). Pay-as-you-go caps sandboxes at 8 vCPU / 8 GB RAM. Not yet a committed run.",
-		},
-		// E2B protocol: resources come from the template (cpu/memory pinned at template create), not
-		// the per-sandbox create() call.
-		specPinning: "fixed",
-		transport: {
-			// Same wrapper (and therefore the same caps) as e2b: `sandbox.commands.run(cmd)` with no
-			// options applies the E2B SDK's default 60s command timeout, and onStdout/onStderr are never
-			// passed through. The compat API exposes the same filesystem + `background`, so detached+poll
-			// is the long-step path.
-			streaming: false,
-			syncCapMs: 60_000,
-			detachedPoll: true,
-		},
-	},
-	namespace: {
-		displayName: "Namespace",
-		website: "https://namespace.so",
-		sdkPackage: "@computesdk/namespace",
-		// NSC_TOKEN_FILE, not NSC_TOKEN: CI federates via GitHub's OIDC identity (nscloud-setup +
-		// `nsc auth exchange-github-token`, no stored secret), which lands the token at the CLI's
-		// standard cache path, wired to NSC_TOKEN_FILE — never a bare bearer string in the environment.
-		// This gate is a strict AND (missingCreds has no OR-group concept), so a local run with a bare
-		// NSC_TOKEN alone still skips even though @computesdk/namespace's own fallback chain would
-		// accept it — for local dev, mint a file instead (`nsc token create --token_file <path>` after
-		// `nsc auth login`) and point NSC_TOKEN_FILE at it, mirroring what CI does.
-		requiredEnvVars: ["NSC_TOKEN_FILE"],
-		isolation: {
-			technology: "microVM (dedicated instance)",
-			notes:
-				"Namespace runs each instance on its own hardware/network (namespace.so/docs/architecture/compute). The @computesdk/namespace wrapper deploys one container workload per instance via the Compute API's `containers` shape, and defines no template/snapshot managers (unexposed, same clean skip as novita) — and, unlike every other provider here, no filesystem manager either.",
-		},
-		pricing: {
-			model: "unknown",
-			notes:
-				"Not yet vetted against a published per-second/hour rate for the Compute API this wrapper drives; namespace.so/pricing documents CI-runner minutes, a distinct product.",
-			sourceUrl: "https://namespace.so/pricing",
-		},
-		maturity: {
-			status: "beta",
-			notes:
-				"Validated live end-to-end once the exec transport was corrected below: system 3/3 metrics, and realworld-better-auth 10/10 metrics with zero gaps on a 570s benchmark step (2.2x the ~4m19s synchronous ceiling). The wrapper's `methods.sandbox` declares no `filesystem` table, so computesdk falls back to its UnsupportedFileSystem (a truthy stub whose every op throws). This note previously claimed that made realworld suites skip here; the better-auth run above disproves it — nothing outside StepRunner.runDetached's done-file poll uses `sandbox.filesystem`, and that degrades to `cat` over exec, so no suite is gated on it. Should a real filesystem ever be needed, the official @namespacelabs/sdk exposes ComputeService.GetSSHConfig (per-instance scoped key + username + endpoint); not wired, since it means managing keys and bypassing the @computesdk/* wrapper this repo standardizes on.",
-		},
-		// virtualCpu/memoryMegabytes are independent, uncoupled knobs on the factory config (unlike
-		// blaxel's memory-derived cpu/disk), so the 4 vCPU / 8 GiB target spec is exactly expressible.
-		specPinning: "settable",
-		transport: {
-			// `runCommand` POSTs to the CommandService's RunCommandSync RPC and awaits the full response.
-			// This was declared uncapped ("no evidence of a server-side cap") until a live smoke produced
-			// the evidence: run 30314097333 lost `mise run benchmark:system:all` at 4m18.8s to a bare
-			// "Namespace command execution failed: The operation timed out." after two of the suite's three
-			// PTS profiles had completed — pybench and sqlite-speedtest wrote their XML, git did not.
-			//
-			// 120s, not the ~259s observed: the measurement is a single data point, and the bare message
-			// (no HTTP status) does not distinguish a Namespace-side cap from a client fetch timeout in the
-			// SDK's `fetch`. Detaching makes that distinction moot — every exec becomes short — so the cap
-			// is set well under the observation rather than tuned to it. Short steps stay synchronous; only
-			// a step BUDGETED past 120s detaches, which is the suite benchmark and the setup installs.
-			streaming: false,
-			syncCapMs: 120_000,
-			// A finite cap requires a durable alternative, and this provider has one despite exposing no
-			// filesystem: StepRunner.runDetached polls the done-file over exec (pollDoneViaCat) when the
-			// filesystem is absent OR is computesdk's throwing UnsupportedFileSystem stub, which is what
-			// this adapter gets — so this declaration depends on that degradation path (isUnsupportedFilesystem).
-			// Each poll is a sub-second exec far under the cap, so a multi-minute benchmark survives as a
-			// sequence of short calls.
-			detachedPoll: true,
-		},
-	},
-};
-
 /** Recursively freeze a value so the shared registry can't be mutated by a downstream consumer. */
 function deepFreeze<T>(value: T): T {
 	for (const key of Object.getOwnPropertyNames(value)) {
@@ -556,11 +218,31 @@ function deepFreeze<T>(value: T): T {
  * versa) is a compile error in that package — the two registries cannot drift.
  */
 export const PROVIDERS: readonly ProviderMeta[] = deepFreeze(
-	(Object.entries(REGISTRY) as [ProviderId, Omit<ProviderMeta, "id">][]).map(([id, meta]) => ({
-		id,
-		...meta,
-	})),
+	PROVIDER_IDS.map((id) => {
+		const source = REGISTRY[id];
+		const inputs = source.inputs.map(normalizeProviderInput);
+		return {
+			id,
+			...source,
+			quotaDomain: quotaDomain(id),
+			inputs,
+			requiredEnvVars: inputs.filter((input) => input.required).map((input) => input.name),
+		};
+	}),
 );
+
+/**
+ * The vendor account a provider's sandboxes are charged to and queued behind. Isolation variants
+ * that share credentials share one domain (daytona-vm and daytona-container → `daytona`); every
+ * other provider is its own. This one lookup names the Actions concurrency group (generated wiring),
+ * the account journal branch and the experiment plan's batches, so they cannot disagree.
+ */
+export function quotaDomain(id: ProviderId): string {
+	// Widen from the descriptor's literal type: most descriptors omit the field, so it is not on the
+	// registry's union type, only on the declared source shape.
+	const meta: ProviderMetaSource = REGISTRY[id];
+	return meta.quotaDomain ?? id;
+}
 
 /**
  * Retired provider ids that committed run documents still carry, each mapped to the current variant
@@ -595,18 +277,59 @@ export function getProvider(id: string): ProviderMeta | undefined {
 }
 
 /**
- * Hourly vCPU + memory cost of a provider at the pinned target spec, or `null` when no vetted rate
- * exists. A provider's included-memory allowance is billed at $0 first; disk (`usdPerGibDiskHour`)
- * is intentionally excluded — see {@link REGISTRY} for why.
+ * The identity a provider is EXPECTED to run its benchmark lane as. Unknown ids (a run document from
+ * a retired provider) fall back to `"root"`, the toolchain's default.
  */
-export function hourlyCostAtTargetSpec(meta: ProviderMeta): number | null {
-	// The union guarantees `usdPerVcpuHour` is present on the `per_vcpu_hour` arm, so narrowing on
-	// `model` is enough — no defensive undefined check needed.
-	if (meta.pricing.model !== "per_vcpu_hour") {
-		return null;
-	}
-	const cpuCost = meta.pricing.usdPerVcpuHour * TARGET_SPEC.vcpus;
-	const billableMemoryGb = Math.max(0, TARGET_SPEC.memoryGb - (meta.pricing.includedMemoryGb ?? 0));
-	const memCost = (meta.pricing.usdPerGibHour ?? 0) * billableMemoryGb;
-	return cpuCost + memCost;
+export function expectedRuntimeIdentity(providerId: string): ProviderRuntimeIdentity {
+	return getProvider(providerId)?.runtimeIdentity ?? "root";
+}
+
+/**
+ * Does an OBSERVED in-sandbox user contradict what the provider declares?
+ *
+ * Compares privilege level, not account name: a provider declared `"unprivileged"` may run as `user`,
+ * `sandbox`, or anything else and that is not news. What IS news either way is a switch — an
+ * unprivileged identity where root was expected (setup and the baked PTS state assume root) or root
+ * where an unprivileged user was expected (a provider silently gained privileges).
+ *
+ * An absent observation is never drift: not every provider's probe reports a user.
+ */
+export function isUnexpectedRuntimeUser(providerId: string, user: string | undefined): boolean {
+	if (!user) return false;
+	return (user === "root" ? "root" : "unprivileged") !== expectedRuntimeIdentity(providerId);
+}
+
+/** Derive one pricing component's vendor billing-unit quantity from a supplied Run target shape. */
+export function pricingQuantityAtTargetSpec(
+	component: PricingComponent,
+	targetSpec: TargetSpec,
+): number {
+	const quantityFor = ({ dimension, unitsPerTargetUnit }: PricingQuantityTerm): number => {
+		const targetUnits = targetSpec[dimension];
+		if (targetUnits === undefined) {
+			throw new Error(`cannot derive ${component.id} quantity without targetSpec.${dimension}`);
+		}
+		return targetUnits * unitsPerTargetUnit;
+	};
+
+	const rule = component.quantityRule;
+	return rule.kind === "linear" ? quantityFor(rule) : Math.max(...rule.terms.map(quantityFor));
+}
+
+/**
+ * Complete deterministic CPU + memory cost at a target spec. Published rates remain
+ * inspectable when this returns `null`: usage- and plan-dependent totals are not headline scalars.
+ */
+export function hourlyCostAtTargetSpec(
+	meta: ProviderMeta,
+	targetSpec: TargetSpec = TARGET_SPEC,
+): number | null {
+	const pricing = meta.pricing;
+	if (pricing.model !== "published" || pricing.targetHourlyCost.kind !== "exact") return null;
+	const components = new Map(pricing.components.map((component) => [component.id, component]));
+	return pricing.targetHourlyCost.componentIds.reduce((total, id) => {
+		// Registry initialization has already established referential integrity.
+		const component = components.get(id) as PricingComponent;
+		return total + component.usdPerUnitHour * pricingQuantityAtTargetSpec(component, targetSpec);
+	}, 0);
 }

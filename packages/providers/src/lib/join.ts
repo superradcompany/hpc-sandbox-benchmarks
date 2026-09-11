@@ -1,10 +1,8 @@
-// The runtime half of the PROVIDERS × adapters join guarantee. The `Record<ProviderId, …>` type on
-// both registries already makes a one-sided provider a *compile* error, but a compile error only
-// protects an in-repo edit: a published/installed build, a downstream consumer, or any path where the
-// schema and providers packages drift to different versions can present a registry pair the compiler
-// never type-checked together. This asserts the two id sets are identical at load and throws naming
-// the exact offenders, so a one-sided provider fails loudly here instead of surfacing as an
-// `undefined` adapter deep inside a benchmark run.
+// The runtime half of the remaining PROVIDERS × adapters join. During DriverModule migration,
+// `adapters` is `Record<LegacyAdapterId, …>` (waived schema ids only). A compile error still
+// catches an in-repo miss; this asserts the two remaining id sets are identical at load so a
+// published/installed build or cross-version drift cannot surface as an `undefined` adapter deep
+// inside a benchmark run.
 
 /**
  * Assert that the schema provider ids and the harness adapter ids are exactly the same set.
@@ -33,4 +31,38 @@ export function assertProviderJoin(
 		parts.push(`have a harness adapter but no schema PROVIDERS entry: ${missingSchema.join(", ")}`);
 	}
 	throw new Error(`Provider registry mismatch — ${parts.join("; ")}`);
+}
+
+/** The create-bounding half of an adapter's contract, as {@link assertCreateCeilingDeclared} reads it. */
+interface CreateBounds {
+	createTimeoutMs?: number | null;
+	createAttemptCeilingMs?: number;
+}
+
+/**
+ * Assert that every adapter which disables the harness's per-attempt create race (`createTimeoutMs:
+ * null`) also declares the ceiling it enforces itself. The two fields are one decision — "I own the
+ * bound" — and only the pair is usable: the harness's create-retry loop subtracts the ceiling from
+ * its remaining budget to decide whether another attempt can still finish in time, so an adapter that
+ * opts out without declaring one silently buys back the overrun the budget exists to prevent (a
+ * 20-minute readiness wait started at minute 59 of a one-hour budget). Checked at load, next to
+ * {@link assertProviderJoin}, because the alternative is discovering it in a matrix job that blew its
+ * timeout. Adapters are passed in as plain records so the guard stays a pure, unit-testable function.
+ *
+ * The ceiling must be POSITIVE, not merely present: zero (or a negative, or a NaN from arithmetic on
+ * an unset constant) reserves nothing, which is the same overrun wearing a declared field. A declared
+ * ceiling that cannot bound an attempt is worse than a missing one — it reads as compliance.
+ */
+export function assertCreateCeilingDeclared(
+	adapters: Readonly<Record<string, CreateBounds>>,
+): void {
+	const undeclared = Object.entries(adapters)
+		.filter(([, a]) => a.createTimeoutMs === null && !((a.createAttemptCeilingMs ?? 0) > 0))
+		.map(([id]) => id);
+	if (undeclared.length === 0) return;
+	throw new Error(
+		`Provider adapter misconfigured — ${undeclared.join(", ")} disabled the harness create timeout ` +
+			`(createTimeoutMs: null) without declaring a positive createAttemptCeilingMs, so the ` +
+			`create-retry budget cannot bound an attempt`,
+	);
 }

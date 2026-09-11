@@ -1,7 +1,14 @@
 // The harness-facing adapter contract. Identity (`name`, `requiredEnvVars`) is owned by the schema's
 // ProviderMeta; this module owns only how to construct a provider and the benchmark's create-time
 // policy. `index.ts` joins the two registries by id (PROVIDERS × adapters, both keyed by ProviderId).
-import type { ProviderId, ProviderTransport } from "@sandbox-benchmarks/schema";
+import type {
+	ProviderCostCell,
+	ProviderCostEvidence,
+	ProviderId,
+	ProviderTransport,
+	SdkProvenance,
+} from "@sandbox-benchmarks/schema";
+import type { DriverResolvedArtifact } from "@sandbox-benchmarks/schema/driver-schemas";
 import type { CreateSandboxOptions, ExplicitComputeConfig } from "computesdk";
 
 /**
@@ -13,6 +20,24 @@ import type { CreateSandboxOptions, ExplicitComputeConfig } from "computesdk";
  */
 export type DirectProvider = NonNullable<ExplicitComputeConfig["provider"]>;
 
+export interface SandboxTeardownResult {
+	completed: boolean;
+	attemptedAt: string;
+	completedAt?: string;
+}
+
+export interface CostEvidenceCaptureInput {
+	cell: ProviderCostCell;
+	providerId: ProviderId;
+	sandboxId: string;
+	teardown: SandboxTeardownResult;
+}
+
+export interface ProviderCostEvidenceCapability {
+	sdk: SdkProvenance;
+	captureAfterTeardown(input: CostEvidenceCaptureInput): Promise<ProviderCostEvidence>;
+}
+
 /**
  * What the harness needs to drive a provider that the framework can't infer:
  * how to construct it, and the benchmark's pinned create-time options.
@@ -21,6 +46,8 @@ export type DirectProvider = NonNullable<ExplicitComputeConfig["provider"]>;
  * streaming, filesystem, destroy), so there is deliberately nothing here that re-implements them.
  */
 export interface ProviderAdapter {
+	/** Exact artifact the adjacent create policy boots; persisted as the request-side attribution. */
+	artifact: DriverResolvedArtifact;
 	/** Construct the computesdk provider for this vendor (a @computesdk/* factory call). Lazy so the
 	 *  registry can be imported without credentials. */
 	createCompute: () => DirectProvider;
@@ -33,8 +60,19 @@ export interface ProviderAdapter {
 	requiredEnvVars?: string[];
 	/** Overrides the harness's default per-attempt create timeout for providers whose `create` does not
 	 *  return until the sandbox is fully booted — the toolchain image pull then happens INSIDE the
-	 *  create call rather than behind a readiness probe. Omitted when the default is adequate. */
-	createTimeoutMs?: number;
+	 *  create call rather than behind a readiness probe. `null` disables the harness race when the
+	 *  adapter owns a bounded readiness wait and must finish its own failed-allocation cleanup before
+	 *  the caller can safely exit. Omitted when the default is adequate. */
+	createTimeoutMs?: number | null;
+	/** Worst-case wall time one `create` can spend before it settles, as bounded by the ADAPTER itself.
+	 *  Required whenever `createTimeoutMs` is `null` (enforced at registry load by
+	 *  {@link assertCreateCeilingDeclared}): with the harness race off, this is the only thing that
+	 *  tells the retry loop how much budget an attempt can consume, and without it the loop can start
+	 *  an attempt that outlives the retry budget it promised. Meaningless — and omitted — when the
+	 *  harness bounds the attempt itself, because there `createTimeoutMs` already IS the ceiling. */
+	createAttemptCeilingMs?: number;
+	/** Optional provider-owned billing hook, invoked only after the harness has attempted teardown. */
+	costEvidence?: ProviderCostEvidenceCapability;
 }
 
 /** A provider as the harness consumes it: schema-owned identity joined with the harness adapter. */

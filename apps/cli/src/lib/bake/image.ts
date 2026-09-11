@@ -3,18 +3,42 @@
 // digest-pinned registry ref, so the candidate base must be pushed before any provider bake.
 // The public `:v1` is never pushed here — that is promote's job.
 import { join } from "node:path";
-import { config } from "@sandbox-benchmarks/providers";
+import { config } from "@sandbox-benchmarks/providers/config";
 import type { Log } from "./types.ts";
 
 // Anchored to this file (not cwd): the `bake` package script runs from apps/cli, where a
 // repo-relative path would resolve to the non-existent apps/cli/packages/... and fail in bash.
 const BUILD_SH = join(import.meta.dir, "../../../../../packages/templates/images/build.sh");
 
-async function run(cmd: string[], log: Log): Promise<void> {
+async function run(cmd: string[], log: Log, extraEnv: Record<string, string> = {}): Promise<void> {
 	log(`$ ${cmd.join(" ")}`);
-	const proc = Bun.spawn(cmd, { stdout: "inherit", stderr: "inherit", env: process.env });
+	const proc = Bun.spawn(cmd, {
+		stdout: "inherit",
+		stderr: "inherit",
+		env: { ...process.env, ...extraEnv },
+	});
 	const code = await proc.exited;
 	if (code !== 0) throw new Error(`${cmd[0]} exited ${code}`);
+}
+
+/**
+ * The GHCR base ref a release phase pins, given whether its scope is PARTIAL.
+ *
+ * A partial release attaches providers to the version already live, so every phase must pin THAT
+ * published version: it is not cutting a new version, and the candidate tag is mutable — it may
+ * already have moved on toward the next one. A full release pins the candidate it just built.
+ *
+ * Single-sourced because three phases have to agree on it and disagreeing is silent: promote pins it
+ * to re-validate before publishing, the plan emits it so the bake cell knows which bytes to mirror
+ * into a vendor registry, and a mismatch would verify one image and ship another.
+ */
+export function releaseBaseTag(partial: boolean): string {
+	return partial ? config.toolchainImageVersion : config.toolchainImageCandidate;
+}
+
+/** What the build phase staged: the digest-pinned candidate base every downstream phase pins. */
+export interface StagedCandidates {
+	base: string;
 }
 
 /** build.sh (base + variants, tagged `:dev` and `:v1`) → retag base `:v1`→`:v1-candidate` → push the
@@ -25,11 +49,12 @@ async function run(cmd: string[], log: Log): Promise<void> {
  *  candidate with an opaque inspection error even when its total compressed size is below the
  *  accepted public image. Normalize the mutable candidate to the same envelope before providers
  *  consume it; the config and layers stay byte-identical. */
-export async function buildAndPushCandidate(log: Log): Promise<void> {
+export async function buildAndPushCandidate(log: Log): Promise<StagedCandidates> {
 	await run(["bash", BUILD_SH], log);
 	await run(["docker", "tag", config.toolchainImageVersion, config.toolchainImageCandidate], log);
 	await run(["docker", "push", config.toolchainImageCandidate], log);
 	await run(imagetoolsNormalizeCmd(config.toolchainImageCandidate), log);
+	return { base: await resolveImageDigestRef(config.toolchainImageCandidate) };
 }
 
 /** Pure: the buildx command that retags one pushed image ref to another registry-side (no pull). */
@@ -110,6 +135,22 @@ export function imageRepo(ref: string): string {
 	return lastColon > lastSlash ? withoutDigest.slice(0, lastColon) : withoutDigest;
 }
 
+/** The bare package name of an image ref — `ghcr.io/org/image:v1` → `image`. This is the identifier
+ *  the GHCR package API (and so the public-package guard) addresses a package by. Built on
+ *  {@link imageRepo} so ref parsing stays in this one module rather than being re-derived by a caller. */
+export function imageName(ref: string): string {
+	const repo = imageRepo(ref);
+	return repo.split("/").pop() ?? repo;
+}
+
+/** The digest of an already-pinned ref — `repo@sha256:…` → `sha256:…`; empty when `ref` carries no
+ *  digest. The inverse of {@link digestPinnedRef}, for callers holding a ref that was pinned earlier
+ *  and needing the bare digest back without a second registry lookup. */
+export function imageDigest(ref: string): string {
+	const at = ref.lastIndexOf("@");
+	return at === -1 ? "" : ref.slice(at + 1);
+}
+
 /** Resolve a pushed `ref` to its immutable registry digest (`sha256:…`) via a registry-side inspect —
  *  no pull. The release records this so every phase pins/records the exact bytes the candidate push
  *  produced (provenance); the TOCTOU guard proper is promote's re-validation of the mutable candidate. */
@@ -173,6 +214,7 @@ export async function imageExistsInRegistry(ref: string): Promise<boolean> {
 export async function promoteImage(
 	log: Log,
 	source: string = config.toolchainImageCandidate,
+	target: string = config.toolchainImageVersion,
 ): Promise<void> {
-	await run(imagetoolsRetagCmd(source, config.toolchainImageVersion), log);
+	await run(imagetoolsRetagCmd(source, target), log);
 }

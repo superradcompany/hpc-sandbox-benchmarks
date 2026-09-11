@@ -29,18 +29,11 @@ const createCompute = () => ({
 	},
 });
 mock.module("@sandbox-benchmarks/providers", () => ({
-	createMicrosandboxCloudCompute: (nofile: number) => {
-		record(`requestedNofile:${nofile}`);
+	config: { toolchainImage: "test-image" },
+	microsandboxCloudCompute: (options: { nofile?: number }) => {
+		if (options.nofile !== undefined) record(`requestedNofile:${options.nofile}`);
 		return createCompute();
 	},
-	providers: [
-		{
-			name: "microsandbox-cloud",
-			transport: {},
-			createOptions: {},
-			createCompute,
-		},
-	],
 }));
 mock.module("@sandbox-benchmarks/harness", () => ({
 	DIR: "/repo",

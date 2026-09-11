@@ -1,5 +1,8 @@
 // Public surface of @sandbox-benchmarks/templates (the "." subpath).
 // Per-provider builders live at their own subpaths: ./e2b, ./daytona, ./modal.
+//
+// Vercel has no builder: it boots the shared toolchain base mirrored into VCR, with no image of its
+// own to describe. A provider only appears here when it needs a variant Dockerfile built for it.
 import { buildDaytonaTemplate } from "./daytona.ts";
 import { buildE2bTemplate } from "./e2b.ts";
 import type { TemplateSpec } from "./lib/internal.ts";
@@ -9,8 +12,12 @@ export type { TemplateSpec };
 export { buildDaytonaTemplate, buildE2bTemplate, buildModalTemplate };
 
 /** Each provider id mapped to its template builder. `templateProviders` is derived from these
- *  keys, so the published id list can't drift from the builders that actually exist. */
-const templateBuilders = {
+ *  keys, so the published id list can't drift from the builders that actually exist.
+ *
+ *  Exported because the `build-template` CLI routes on it. It used to keep its own copy of this
+ *  map, which silently went stale the moment a provider was added here — `build-template vercel`
+ *  reported `Unknown provider` while `templateProviders` advertised it. One map, no drift. */
+export const templateBuilders = {
 	e2b: buildE2bTemplate,
 	daytona: buildDaytonaTemplate,
 	modal: buildModalTemplate,

@@ -23,7 +23,16 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ExecResult, ExecutionPolicy, SandboxSession } from "@sandbox-benchmarks/driver";
+import {
+	launchDetached,
+	redactDiagnosticText,
+	selectExecutionRoute,
+} from "@sandbox-benchmarks/driver";
+import { diagnosticSecretsFromEnv } from "@sandbox-benchmarks/driver/env";
 import type { ProviderTransport } from "@sandbox-benchmarks/schema";
+import { PTS_STATE_SELECT_SH } from "@sandbox-benchmarks/schema";
+import { completionCode, detachedCommand } from "./completion.ts";
 import { GapError } from "./gap-cause.ts";
 
 export const MIN = 60_000;
@@ -54,15 +63,47 @@ const READBACK_ATTEMPTS = 5;
 const READBACK_DELAY_MS = 2_000;
 /** Done-file sentinel for the no-filesystem cat-poll fallback: printed while the file isn't there yet. */
 const RUNNING_SENTINEL = "__RUNNING__";
+function observationBudget(deadline: number): number {
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) throw new Error("step observation deadline exceeded");
+	return Math.min(POLL_CAP_MS, remaining);
+}
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export type Phase = "create" | "setup" | "benchmark" | "collect";
 
+/**
+ * One executed ATTEMPT of a step. A retried step (setup steps declare `retries`; the collect loop
+ * re-runs its step through transient read-back failures) logs one entry per attempt, so a receipt
+ * reader must judge a step by its final entry, not by every entry. `allowFailure` records the
+ * declared policy so the reader can tell a tolerated non-zero exit from a real one.
+ */
 export interface StepLogEntry {
 	phase: Phase;
 	label: string;
 	ms: number;
 	exitCode: number | null;
+	/** Present (true) only when the step was declared `allowFailure`. */
+	allowFailure?: boolean;
+}
+
+export interface DetachedStepEvidence {
+	identity: string;
+	label: string;
+	phase: Phase;
+	/** Present (true) only when the step was declared `allowFailure`. */
+	allowFailure?: boolean;
+	state:
+		| "launch-pending"
+		| "launch-accepted"
+		| "running"
+		| "observation-unavailable"
+		| "completed"
+		| "deadline-exceeded"
+		| "collection-failed";
+	exitCode: number | null;
+	lastObservationMs?: number;
+	logTail?: string | null;
 }
 
 /** The result of one in-sandbox command. */
@@ -104,9 +145,8 @@ export const DEFAULT_TRANSPORT: ProviderTransport = Object.freeze({
  * not `>`: when `syncCapMs` equals a provider's hard limit (E2B's `syncCapMs` *is* its SDK
  * `defaultProcessConnectionTimeout`), a step budgeted at exactly the cap could run right up to it and
  * drop the connection with no margin — so a budget that *reaches* the cap detaches, not just one that
- * exceeds it. `streaming` is modeled on the capability but does not tip this decision today: no shipped
- * `@computesdk/*` adapter delivers incremental output, so there is no streaming transport to prefer —
- * when one lands, it is selected here.
+ * exceeds it. `streaming` is modeled on the capability but does not tip this decision today: run.cloud
+ * delivers incremental output, while the selector still uses the same conservative synchronous cap.
  */
 export function selectTransport(transport: ProviderTransport, timeoutMs: number): TransportKind {
 	const couldExceedSyncCap = transport.syncCapMs !== null && timeoutMs >= transport.syncCapMs;
@@ -121,8 +161,8 @@ export interface SandboxFilesystem {
 
 /** The slice of a computesdk sandbox the suite runner needs (its `Sandbox` satisfies this). */
 export interface SandboxHandle {
-	/** Provider identity, when available, for live placement verification. */
-	sandboxId?: string;
+	/** Universal ComputeSDK sandbox identity, snapshotted before teardown for cost attribution. */
+	readonly sandboxId?: string;
 	runCommand(command: string, options?: RunCommandOptions): Promise<CommandResult>;
 	destroy(): Promise<unknown>;
 	/** Present on real computesdk sandboxes; enables the durable detached transport for long steps. */
@@ -198,12 +238,6 @@ function stepTimeout(label: string, timeoutMs: number): GapError {
 /** Single-quote a script for safe embedding in `bash -c '<script>'`. */
 export function shellQuote(script: string): string {
 	return `'${script.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Parse a done-file's exit-code contents, defaulting a malformed value to a failure (1). */
-function parseExitCode(raw: string): number {
-	const code = Number.parseInt(raw, 10);
-	return Number.isFinite(code) ? code : 1;
 }
 
 /**
@@ -320,9 +354,10 @@ const PREAMBLE_HEAD = [
 	// Distro pythons are PEP 668 externally-managed, but PTS profiles pip-install their harness —
 	// fine in a throwaway sandbox; the baked image sets the same.
 	"export PIP_BREAK_SYSTEM_PACKAGES=1",
-	// E2B-compatible builders inject an unprivileged runtime user. Point PTS at the root-baked profile
-	// registry explicitly even if a provider strips the Docker ENV while importing the image.
-	"if [ -d /var/lib/phoronix-test-suite ]; then export PTS_USER_PATH_OVERRIDE=/var/lib/phoronix-test-suite/; fi",
+	// Keep the root-baked installed profiles shared, but never point an injected unprivileged user at
+	// root's mutable PTS state. Canonical snippet — see PTS_STATE_SELECT_SH for the full rationale and
+	// for why this must also run at runtime rather than only in the image ENV.
+	PTS_STATE_SELECT_SH,
 ];
 
 /**
@@ -392,13 +427,20 @@ function startHeartbeat(label: string, startedAt: number, timeoutMs: number): ()
  */
 export class LogReadbackError extends Error {}
 
-export class StepRunner {
+abstract class StepExecution<Result extends { stdout?: string; stderr?: string }> {
 	/** The phase subsequent steps are charged to. */
 	phase: Phase = "setup";
 	/** Every executed step with its phase, elapsed ms, and exit code. */
 	readonly stepLog: StepLogEntry[] = [];
+	readonly detachedEvidence: DetachedStepEvidence[] = [];
 	/** The in-sandbox preamble prepended to every step, carrying this run's PTS pass policy. */
 	private readonly preamble: string;
+	/**
+	 * Credential values to scrub from echoed output, snapshotted once per runner. Deriving them walks
+	 * every registered provider's inputs, and a runner redacts on every stdout/stderr write of every
+	 * step — recomputing there made each output line pay the whole registry walk.
+	 */
+	private readonly secrets: readonly string[] = diagnosticSecretsFromEnv(process.env);
 	/**
 	 * The sandbox filesystem WHILE it is usable — cleared for good the first time it proves it isn't.
 	 *
@@ -411,21 +453,28 @@ export class StepRunner {
 	 */
 	private pollFs?: SandboxFilesystem;
 
-	constructor(
-		private readonly sandbox: SandboxHandle,
-		/** The provider's exec transport capability — {@link step} selects sync vs detached from it. */
-		private readonly transport: ProviderTransport = DEFAULT_TRANSPORT,
-		/** The inter-poll sleep used by {@link runDetached}; injectable so tests can assert the backoff
-		 *  schedule without real waiting. */
-		private readonly sleep: (ms: number) => Promise<void> = delay,
-		/** How many timed PTS passes each case runs, or `converge` for PTS's own convergence. Omitted →
-		 *  {@link DEFAULT_PTS_PASS_POLICY} (fixed k=2), so a StepRunner built without one keeps the old
-		 *  behaviour. Resolved from the suite + `BENCH_PTS_PASSES` by {@link resolvePtsPassPolicy}. */
-		passPolicy: PtsPassPolicy = DEFAULT_PTS_PASS_POLICY,
+	protected constructor(
+		filesystem: SandboxFilesystem | undefined,
+		private readonly sleep: (ms: number) => Promise<void>,
+		passPolicy: PtsPassPolicy,
+		private readonly phaseDeadline?: (phase: Phase) => number,
 	) {
 		this.preamble = buildPreamble(passPolicy);
-		this.pollFs = sandbox.filesystem;
+		this.pollFs = filesystem;
 	}
+
+	private boundedTimeout(timeoutMs: number): number {
+		const remaining = this.phaseDeadline ? this.phaseDeadline(this.phase) - Date.now() : Infinity;
+		if (remaining <= 0) throw new Error(`${this.phase} phase deadline exceeded`);
+		return Math.min(timeoutMs, remaining);
+	}
+
+	protected abstract execute(command: string): Promise<Result>;
+	protected abstract launch(command: string): Promise<void>;
+	protected abstract detached(timeoutMs: number): boolean;
+	protected abstract exitCode(result: Result): number | null;
+	protected abstract describeExit(result: Result): string;
+	protected abstract completed(code: number | null, stdout: string, durationMs: number): Result;
 
 	/**
 	 * Observe a detached step's completion once: the exit code, or `undefined` while it is still running.
@@ -437,10 +486,14 @@ export class StepRunner {
 	 * real Blaxel incident, 2026-07-19), where permanent absence must abandon it, and only the stub's own
 	 * error distinguishes the two. A dead sandbox is still caught, because the cat poll will fail too.
 	 */
-	private async pollDoneOnce(donePath: string, label: string): Promise<number | undefined> {
-		if (!this.pollFs) return this.pollDoneViaCat(donePath);
+	private async pollDoneOnce(
+		donePath: string,
+		label: string,
+		deadline: number,
+	): Promise<number | null | undefined> {
+		if (!this.pollFs) return this.pollDoneViaCat(donePath, deadline);
 		try {
-			return await this.pollDoneViaFs(this.pollFs, donePath);
+			return await this.pollDoneViaFs(this.pollFs, donePath, deadline);
 		} catch (err) {
 			if (!isUnsupportedFilesystem(err)) throw err;
 			console.log(
@@ -448,7 +501,7 @@ export class StepRunner {
 					`falling back to the exec done-file poll`,
 			);
 			this.pollFs = undefined;
-			return this.pollDoneViaCat(donePath);
+			return this.pollDoneViaCat(donePath, deadline);
 		}
 	}
 
@@ -465,8 +518,8 @@ export class StepRunner {
 		script: string,
 		timeoutMs: number,
 		opts: StepOptions = {},
-	): Promise<CommandResult> {
-		return selectTransport(this.transport, timeoutMs) === "detached"
+	): Promise<Result> {
+		return this.detached(timeoutMs)
 			? this.runDetached(label, script, timeoutMs, opts)
 			: this.run(label, script, timeoutMs, opts);
 	}
@@ -482,21 +535,36 @@ export class StepRunner {
 		script: string,
 		timeoutMs: number,
 		opts: StepOptions = {},
-	): Promise<CommandResult> {
+	): Promise<Result> {
+		timeoutMs = this.boundedTimeout(timeoutMs);
 		console.log(`\n=== [${label}] ===`);
 		const started = performance.now();
 		const stopHeartbeat = startHeartbeat(label, started, timeoutMs);
-		let result: CommandResult;
+		let result: Result;
 		try {
 			result = await withTimeout(
-				this.sandbox.runCommand(`bash -c ${shellQuote(`${this.preamble}; ${script}`)}`),
+				this.execute(`bash -c ${shellQuote(`${this.preamble}; ${script}`)}`),
 				timeoutMs,
 				() => stepTimeout(label, timeoutMs),
 			);
+		} catch (error) {
+			this.recordStep(label, performance.now() - started, null, opts);
+			throw error;
 		} finally {
 			stopHeartbeat();
 		}
 		return this.finishStep(label, started, result, opts);
+	}
+
+	/** Append one attempt to the step log, carrying the declared failure policy when it was set. */
+	private recordStep(label: string, ms: number, exitCode: number | null, opts: StepOptions): void {
+		this.stepLog.push({
+			phase: this.phase,
+			label,
+			ms,
+			exitCode,
+			...(opts.allowFailure ? { allowFailure: true } : {}),
+		});
 	}
 
 	/**
@@ -519,13 +587,50 @@ export class StepRunner {
 		script: string,
 		timeoutMs: number,
 		opts: StepOptions = {},
-	): Promise<CommandResult> {
+	): Promise<Result> {
+		timeoutMs = this.boundedTimeout(timeoutMs);
 		console.log(`\n=== [${label}] (detached) ===`);
 		const started = performance.now();
 		const stopHeartbeat = startHeartbeat(label, started, timeoutMs);
 		const tag = `bench-${randomUUID()}`;
-		const logPath = `/tmp/${tag}.log`;
-		const donePath = `/tmp/${tag}.done`;
+		const logPath = `/tmp/${tag}/output.log`;
+		const donePath = `/tmp/${tag}/completion.done`;
+		const deadline = started + timeoutMs;
+		const evidence: DetachedStepEvidence = {
+			identity: tag,
+			label,
+			phase: this.phase,
+			...(opts.allowFailure ? { allowFailure: true } : {}),
+			state: "launch-pending",
+			exitCode: null,
+		};
+		this.detachedEvidence.push(evidence);
+		const logCount = this.stepLog.length;
+		const remaining = () => Math.max(1, deadline - performance.now());
+		let timeoutEvidenceCaptured = false;
+		const recoverTimeoutEvidence = async () => {
+			if (timeoutEvidenceCaptured) return;
+			timeoutEvidenceCaptured = true;
+			evidence.state = "deadline-exceeded";
+			const rawTail = await this.readLogTail(this.pollFs, logPath);
+			const tail =
+				rawTail === null ? null : redactDiagnosticText(rawTail, this.secrets).slice(-8192);
+			evidence.logTail = tail;
+			// Best-effort stop the detached job; don't let a failing kill mask the timeout.
+			await withTimeout(
+				this.execute(`pkill -f ${shellQuote(tag)} || true`),
+				POLL_CAP_MS,
+				"stop timed-out step",
+			).catch(() => undefined);
+			if (tail === null) {
+				console.log(
+					`--- "${label}" timed out and its log could not be read: output observation is unavailable ` +
+						`and the cause is unknown ---`,
+				);
+			} else if (tail) {
+				console.log(`--- last output from "${label}" before timeout ---\n${tail}`);
+			}
+		};
 		try {
 			// Start fully detached so the job outlives the (short-lived, 408-prone) exec round-trip.
 			// Run preamble+script in a nested `bash -c` so `set -eo pipefail` governs the inner shell:
@@ -533,30 +638,36 @@ export class StepRunner {
 			// failure followed by a passing command would exit 0 and be recorded as success. The inner
 			// shell aborts on first failure and its real exit code flows through the `&&/||` capture —
 			// success writes 0, failure writes the real code.
-			const wrapped =
-				`bash -c ${shellQuote(`${this.preamble}; ${script}`)} > ${logPath} 2>&1 ` +
-				`&& echo 0 > ${donePath} || echo $? > ${donePath}`;
-			// Double-fork daemonization: a single nohup/setsid still blocks e2b's envd, which holds the
-			// exec open for as long as its DIRECT child lives (probed live: even `nohup ... &` pins the
-			// exec for the child's whole life; setsid doesn't help). So the direct child backgrounds the
-			// real job via a second nohup and exits at once — Daytona/Blaxel detach fine either way.
-			const daemonized = `nohup bash -c ${shellQuote(wrapped)} </dev/null >/dev/null 2>&1 &`;
-			const launch = `nohup bash -c ${shellQuote(daemonized)} </dev/null >/dev/null 2>&1 & echo launched`;
-			await this.sandbox.runCommand(`bash -c ${shellQuote(launch)}`, { background: true });
+			const wrapped = detachedCommand(tag, `${this.preamble}; ${script}`);
+			await withTimeout(this.launch(wrapped), remaining(), () => stepTimeout(label, timeoutMs));
+			evidence.state = "launch-accepted";
 
 			// Poll for the done-file, backing off adaptively so a quick step isn't over-charged for polls.
-			const deadline = started + timeoutMs;
 			let pollDelayMs = POLL_START_MS;
 			let consecutivePollFailures = 0;
 			for (;;) {
 				// A poll that THROWS is different from "not done yet": one blip is transient, but a run of
 				// them means the sandbox stopped answering — fail fast instead of sitting on a dead sandbox
 				// for the rest of the command budget (see MAX_CONSECUTIVE_POLL_FAILURES).
-				let exitCode: number | undefined;
+				let exitCode: number | null | undefined;
 				try {
-					exitCode = await this.pollDoneOnce(donePath, label);
+					exitCode = await withTimeout(
+						this.pollDoneOnce(donePath, label, deadline),
+						remaining(),
+						() => stepTimeout(label, timeoutMs),
+					);
+					evidence.lastObservationMs = Math.round(performance.now() - started);
+					evidence.state =
+						exitCode === undefined
+							? "running"
+							: exitCode === null
+								? "observation-unavailable"
+								: "completed";
+					evidence.exitCode = exitCode ?? null;
 					consecutivePollFailures = 0;
 				} catch (err) {
+					if (err instanceof GapError && err.gapCause.kind === "step-timeout") throw err;
+					evidence.state = "observation-unavailable";
 					consecutivePollFailures++;
 					if (consecutivePollFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
 						const reason = err instanceof Error ? err.message : String(err);
@@ -571,8 +682,23 @@ export class StepRunner {
 					try {
 						// this.pollFs, not the raw capability: once the poll has degraded, the read-back must not
 						// re-try the same broken API and burn its whole retry budget rediscovering that.
-						const stdout = await this.readCompletedLog(this.pollFs, logPath, label);
-						return this.finishStep(label, started, { exitCode, stdout }, opts);
+						let stdout: string;
+						try {
+							stdout = await withTimeout(
+								this.readCompletedLog(this.pollFs, logPath, label, deadline),
+								remaining(),
+								() => stepTimeout(label, timeoutMs),
+							);
+						} catch (error) {
+							evidence.state = "collection-failed";
+							throw error;
+						}
+						return this.finishStep(
+							label,
+							started,
+							this.completed(exitCode, stdout, performance.now() - started),
+							opts,
+						);
 					} finally {
 						// The read-back is done — its contents are in memory — so drop the log/done files
 						// now. collectResults re-runs the WHOLE detached step on a transient read-back
@@ -587,24 +713,24 @@ export class StepRunner {
 					// A timed-out step is otherwise a black box: the log lives only inside the sandbox, and
 					// a step that hangs is exactly the one whose output we need. Best-effort — a failed read
 					// must not mask the timeout.
-					const tail = await this.readLogTail(this.pollFs, logPath);
-					// Best-effort stop the detached job; don't let a failing kill mask the timeout.
-					await this.sandbox
-						.runCommand(`pkill -f ${shellQuote(tag)} || true`)
-						.catch(() => undefined);
-					if (tail === null) {
-						console.log(
-							`--- "${label}" timed out and its log could not be read: the sandbox stopped ` +
-								`responding (memory exhaustion or a dead agent), rather than running quietly ---`,
-						);
-					} else if (tail) {
-						console.log(`--- last output from "${label}" before timeout ---\n${tail}`);
-					}
+					await recoverTimeoutEvidence();
 					throw stepTimeout(label, timeoutMs);
 				}
-				await this.sleep(pollDelayMs);
+				await this.sleep(Math.min(pollDelayMs, remaining()));
 				pollDelayMs = Math.min(pollDelayMs * POLL_BACKOFF, POLL_CAP_MS);
 			}
+		} catch (error) {
+			if (
+				((error instanceof GapError && error.gapCause.kind === "step-timeout") ||
+					performance.now() >= deadline) &&
+				evidence.state !== "completed" &&
+				evidence.state !== "collection-failed"
+			) {
+				await recoverTimeoutEvidence();
+			}
+			if (this.stepLog.length === logCount)
+				this.recordStep(label, Math.round(performance.now() - started), evidence.exitCode, opts);
+			throw error;
 		} finally {
 			stopHeartbeat();
 		}
@@ -615,32 +741,44 @@ export class StepRunner {
 	private async pollDoneViaFs(
 		fs: SandboxFilesystem,
 		donePath: string,
-	): Promise<number | undefined> {
+		deadline: number,
+	): Promise<number | null | undefined> {
 		// Bound both fs calls so a hung filesystem API (some adapters go over the network) can't
 		// stall the poll loop indefinitely — the outer deadline only advances between iterations.
 		// A timeout or fs error THROWS to the poll loop, which tolerates a transient blip but fails
 		// fast on a run of them (a dead sandbox); swallowing errors here once made a killed sandbox
 		// indistinguishable from a quietly-running step for the entire command budget.
-		if (!(await withTimeout(fs.exists(donePath), POLL_CAP_MS, "done-file fs exists"))) {
+		observationBudget(deadline);
+		if (
+			!(await withTimeout(fs.exists(donePath), observationBudget(deadline), "done-file fs exists"))
+		) {
 			return undefined;
 		}
-		// The background script writes the done-file non-atomically (truncate, then echo the code),
-		// so an empty read means "created but not yet written" — still running, not exit 0.
-		const raw = (await withTimeout(fs.readFile(donePath), POLL_CAP_MS, "done-file fs read")).trim();
-		return raw === "" ? undefined : parseExitCode(raw);
+		// Empty data cannot establish completion, even if the storage transport reports existence.
+		observationBudget(deadline);
+		const raw = await withTimeout(
+			fs.readFile(donePath),
+			observationBudget(deadline),
+			"done-file fs read",
+		);
+		return raw === "" ? undefined : completionCode(raw, donePath.split("/")[2] ?? "");
 	}
 
 	/** Poll fallback for providers whose adapter exposes no filesystem API: read the done-file with a
 	 *  `cat` exec, treating the {@link RUNNING_SENTINEL} (or empty output) as not-done-yet. */
-	private async pollDoneViaCat(donePath: string): Promise<number | undefined> {
+	private async pollDoneViaCat(
+		donePath: string,
+		deadline: number,
+	): Promise<number | null | undefined> {
 		// Bound the exec so a hung `cat` can't outlast the step budget. An exec failure or timeout
 		// THROWS to the poll loop (which tolerates transient blips but fails fast on a dead sandbox);
 		// an absent done-file is the RUNNING_SENTINEL, not an error.
+		observationBudget(deadline);
 		const probe = await withTimeout(
-			this.sandbox.runCommand(
+			this.execute(
 				`bash -c ${shellQuote(`cat ${donePath} 2>/dev/null || echo ${RUNNING_SENTINEL}`)}`,
 			),
-			POLL_CAP_MS,
+			observationBudget(deadline),
 			"done-file cat poll",
 		);
 		// The `|| echo RUNNING_SENTINEL` guard makes bash exit 0 whether the done-file is present or
@@ -648,14 +786,14 @@ export class StepRunner {
 		// missing done-file. THROW so the poll loop's consecutive-failure fast-fail engages, matching
 		// pollDoneViaFs; swallowing it as "still running" would sit on a dead sandbox for the whole
 		// step budget — the exact failure this detached path exists to catch.
-		if (probe.exitCode !== 0) {
+		if (this.exitCode(probe) !== 0) {
 			throw new Error(
-				`done-file cat poll returned exit ${probe.exitCode} — sandbox not responding`,
+				`done-file cat poll returned exit ${this.exitCode(probe)} — sandbox not responding`,
 			);
 		}
-		const out = (probe.stdout ?? "").trim();
-		if (out === "" || out === RUNNING_SENTINEL) return undefined;
-		return parseExitCode(out);
+		const out = probe.stdout ?? "";
+		if (out === "" || out.trim() === RUNNING_SENTINEL) return undefined;
+		return completionCode(out, donePath.split("/")[2] ?? "");
 	}
 
 	/** The last {@link TIMEOUT_LOG_TAIL_LINES} lines of a detached step's log, or `null` when the log
@@ -687,27 +825,34 @@ export class StepRunner {
 		fs: SandboxFilesystem | undefined,
 		logPath: string,
 		label: string,
+		deadline: number,
 	): Promise<string> {
 		let lastFailure = "";
 		for (let attempt = 1; attempt <= READBACK_ATTEMPTS; attempt++) {
+			observationBudget(deadline);
 			if (fs) {
 				try {
-					return await withTimeout(fs.readFile(logPath), POLL_CAP_MS, "log fs read");
+					return await withTimeout(
+						fs.readFile(logPath),
+						observationBudget(deadline),
+						"log fs read",
+					);
 				} catch (err) {
 					lastFailure = err instanceof Error ? err.message : String(err);
 				}
 			} else {
-				const text = await this.catLogOrNull(logPath);
+				const text = await this.catLogOrNull(logPath, deadline);
 				if (text !== null) return text;
 				lastFailure = "log cat read failed";
 			}
-			if (attempt < READBACK_ATTEMPTS) await this.sleep(READBACK_DELAY_MS);
+			if (attempt < READBACK_ATTEMPTS)
+				await this.sleep(Math.min(READBACK_DELAY_MS, observationBudget(deadline)));
 		}
 		// Cross-transport fallback: the fs API can be freshly wedged while plain exec still answers —
 		// try the other transport before declaring the log unreachable. (No-fs sandboxes already spent
 		// every attempt on exec; there is no other transport to try.)
 		if (fs) {
-			const text = await this.catLogOrNull(logPath);
+			const text = await this.catLogOrNull(logPath, deadline);
 			if (text !== null) return text;
 			lastFailure = `${lastFailure}; exec fallback also failed`;
 		}
@@ -721,17 +866,18 @@ export class StepRunner {
 	/** `cat` the log over exec for {@link readLogTail} and {@link readCompletedLog}, preserving a read
 	 *  failure as `null` rather than folding it into `""` — an unreadable log (wedged sandbox, dead
 	 *  transport) must stay distinguishable from a step that simply printed nothing. */
-	private async catLogOrNull(logPath: string): Promise<string | null> {
+	private async catLogOrNull(logPath: string, deadline = Infinity): Promise<string | null> {
 		// No `|| true`: a failing cat (unreadable/absent log) must surface as null, not as a
 		// successful empty read — `|| true` once collapsed exec-transport failure into stdout "",
 		// which readCompletedLog then accepted as the step's real (empty) output. Exit 0 with empty
 		// stdout remains a legitimate read of a genuinely empty log.
+		observationBudget(deadline);
 		return withTimeout(
-			this.sandbox.runCommand(`bash -c ${shellQuote(`cat ${logPath} 2>/dev/null`)}`),
-			POLL_CAP_MS,
+			this.execute(`bash -c ${shellQuote(`cat ${logPath} 2>/dev/null`)}`),
+			observationBudget(deadline),
 			"log cat read",
 		)
-			.then((res) => ((res.exitCode ?? 0) === 0 ? (res.stdout ?? "") : null))
+			.then((res) => (this.exitCode(res) === 0 ? (res.stdout ?? "") : null))
 			.catch(() => null);
 	}
 
@@ -741,49 +887,124 @@ export class StepRunner {
 	 *  failed rm just leaves the same orphaned files the sandbox teardown reclaims anyway. */
 	private async removeDetachedFiles(logPath: string, donePath: string): Promise<void> {
 		await withTimeout(
-			this.sandbox.runCommand(`bash -c ${shellQuote(`rm -f ${logPath} ${donePath}`)}`),
+			this.execute(
+				`bash -c ${shellQuote(`rm -f ${logPath} ${donePath}; rmdir ${donePath.slice(0, donePath.lastIndexOf("/"))}`)}`,
+			),
 			POLL_CAP_MS,
 			"detached file cleanup",
 		).catch(() => undefined);
 	}
 
 	/** Shared post-step bookkeeping: record the step, echo output (unless silent), enforce exit code. */
-	private finishStep(
-		label: string,
-		started: number,
-		result: CommandResult,
-		opts: StepOptions,
-	): CommandResult {
+	private finishStep(label: string, started: number, result: Result, opts: StepOptions): Result {
 		const elapsedMs = Math.round(performance.now() - started);
 		const elapsedS = (elapsedMs / 1000).toFixed(1);
-		this.stepLog.push({
-			phase: this.phase,
-			label,
-			ms: elapsedMs,
-			exitCode: result.exitCode,
-		});
+		this.recordStep(label, elapsedMs, this.exitCode(result), opts);
 
 		if (result.stdout && !opts.silent) {
-			process.stdout.write(result.stdout.endsWith("\n") ? result.stdout : `${result.stdout}\n`);
+			const stdout = redactDiagnosticText(result.stdout, this.secrets);
+			process.stdout.write(stdout.endsWith("\n") ? stdout : `${stdout}\n`);
 		}
 		if (result.stderr && !opts.silent) {
-			process.stderr.write(result.stderr.endsWith("\n") ? result.stderr : `${result.stderr}\n`);
+			const stderr = redactDiagnosticText(result.stderr, this.secrets);
+			process.stderr.write(stderr.endsWith("\n") ? stderr : `${stderr}\n`);
 		}
-		console.log(`=== [${label}] exit ${result.exitCode} in ${elapsedS}s ===`);
+		console.log(`=== [${label}] exit ${this.describeExit(result)} in ${elapsedS}s ===`);
 
-		if (result.exitCode !== 0 && !opts.allowFailure) {
+		if (this.exitCode(result) !== 0 && !opts.allowFailure) {
 			// A silent step withheld its output above; surface it now so the failure is debuggable. The
 			// detached transport merges stderr into stdout (2>&1), so fall back to stdout when no stderr.
 			if (opts.silent) {
-				const tail = result.stderr || result.stdout;
+				const tail = redactDiagnosticText(result.stderr || result.stdout || "", this.secrets);
 				if (tail) process.stderr.write(tail.endsWith("\n") ? tail : `${tail}\n`);
 			}
-			throw new GapError(`Step "${label}" failed with exit code ${result.exitCode}`, {
+			const code = this.exitCode(result);
+			if (code === null) throw new Error(`Step "${label}" failed: ${this.describeExit(result)}`);
+			throw new GapError(`Step "${label}" failed with exit code ${this.describeExit(result)}`, {
 				kind: "step-failed",
 				step: label,
-				exitCode: result.exitCode,
+				exitCode: code,
 			});
 		}
 		return result;
+	}
+}
+
+/** Legacy execution facade retained until the last provider migration. */
+export class StepRunner extends StepExecution<CommandResult> {
+	constructor(
+		private readonly sandbox: SandboxHandle,
+		private readonly transport: ProviderTransport = DEFAULT_TRANSPORT,
+		sleep: (ms: number) => Promise<void> = delay,
+		passPolicy: PtsPassPolicy = DEFAULT_PTS_PASS_POLICY,
+	) {
+		super(sandbox.filesystem, sleep, passPolicy);
+	}
+	protected execute(command: string): Promise<CommandResult> {
+		return this.sandbox.runCommand(command);
+	}
+	protected async launch(command: string): Promise<void> {
+		const daemonized = `nohup bash -c ${shellQuote(command)} </dev/null >/dev/null 2>&1 &`;
+		const launch = `nohup bash -c ${shellQuote(daemonized)} </dev/null >/dev/null 2>&1 & echo launched`;
+		await this.sandbox.runCommand(`bash -c ${shellQuote(launch)}`, { background: true });
+	}
+	protected detached(timeoutMs: number): boolean {
+		return selectTransport(this.transport, timeoutMs) === "detached";
+	}
+	protected exitCode(result: CommandResult): number {
+		return result.exitCode;
+	}
+	protected describeExit(result: CommandResult): string {
+		return String(result.exitCode);
+	}
+	protected completed(exitCode: number | null, stdout: string): CommandResult {
+		return { exitCode: exitCode ?? 1, stdout };
+	}
+}
+
+/** Runs workload steps directly on a driver session, retaining its full execution result. */
+export class SessionStepRunner extends StepExecution<ExecResult> {
+	constructor(
+		private readonly session: SandboxSession,
+		private readonly execution: ExecutionPolicy,
+		sleep: (ms: number) => Promise<void> = delay,
+		passPolicy: PtsPassPolicy = DEFAULT_PTS_PASS_POLICY,
+		phaseDeadline?: (phase: Phase) => number,
+	) {
+		super(session.files, sleep, passPolicy, phaseDeadline);
+	}
+	protected execute(command: string): Promise<ExecResult> {
+		return this.session.exec(command);
+	}
+	protected launch(command: string): Promise<void> {
+		return launchDetached(this.session, command);
+	}
+	protected detached(timeoutMs: number): boolean {
+		return selectExecutionRoute(this.execution, timeoutMs) === "durable";
+	}
+	protected exitCode(result: ExecResult): number | null {
+		return result.exit.kind === "exited" ? result.exit.code : null;
+	}
+	protected describeExit(result: ExecResult): string {
+		switch (result.exit.kind) {
+			case "exited":
+				return String(result.exit.code);
+			case "signalled":
+				return `signal ${result.exit.signal}`;
+			case "unknown":
+				return `unknown (${result.exit.detail})`;
+		}
+	}
+	protected completed(code: number | null, stdout: string, durationMs: number): ExecResult {
+		return {
+			exit:
+				code === null
+					? { kind: "unknown", detail: "invalid detached completion status" }
+					: { kind: "exited", code },
+			stdout,
+			stderr: "",
+			durationMs,
+			truncated: false,
+		};
 	}
 }

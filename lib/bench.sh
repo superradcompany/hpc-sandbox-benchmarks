@@ -17,6 +17,33 @@
 
 # --- Tolerant probes ---
 
+# Is a tool on PATH? Every probe in this repo asks that question, and asking it by name keeps the
+# call sites reading as the capability check they are rather than as shell plumbing.
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- Human report rows ---
+# One aligned "label   value" line, the shape every tolerant probe prints. Shared because the column
+# width would otherwise be hand-kept in agreement across a probe's task and its library — and because
+# the continuation indent below has to be derived from it, not guessed.
+#
+# An EMPTY value prints nothing: a probe reports what it observed, and a blank row is not an
+# observation. A caller that wants a row unconditionally passes a composed value that is never empty.
+BENCH_ROW_LABEL_WIDTH=26
+bench_row() {
+	[ -n "${2:-}" ] && printf '  %-*s %s\n' "$BENCH_ROW_LABEL_WIDTH" "$1" "$2"
+	return 0
+}
+
+# Same row, for a value composed of `|`-joined parts: each part gets its own line, aligned under the
+# first. The indent is computed from the column width so the two cannot drift apart.
+bench_rows() {
+	[ -n "${2:-}" ] || return 0
+	local pad
+	printf -v pad '%*s' "$((BENCH_ROW_LABEL_WIDTH + 3))" ''
+	bench_row "$1" "${2//|/$'\n'${pad}}"
+	return 0
+}
+
 # Run a command; on failure print why and return 0 (never abort).
 try() {
 	"$@" 2>/dev/null && return 0
@@ -51,6 +78,13 @@ task_result_name() {
 	local script_path="${BASH_SOURCE[${#BASH_SOURCE[@]} - 1]}"
 	local tasks_dir="${REPO_ROOT}/.mise/tasks/benchmark/"
 	local relative="${script_path#"$tasks_dir"}"
+	# `_default` is mise's spelling for a GROUP's own task: `.mise/tasks/a/b/_default` loads as the
+	# task `a:b`, not `a:b:_default`. It names no leaf, so it contributes nothing to the result name.
+	# Without this, moving a task into a directory to give it sibling leaves silently renames its
+	# artifact — and packages/results/src/lib/host-metadata.ts matches these files by EXACT name, so
+	# the rename would drop that probe from every future run and from every retroactive
+	# re-normalization of the committed raw tree.
+	relative="${relative%/_default}"
 	local name="${relative//\//-}"
 	[ -n "$suffix" ] && name="${name}--${suffix}"
 	echo "$name"
@@ -123,7 +157,7 @@ json_result() {
 	output="$(result_path "$name")"
 	tmp="$(mktemp "$(results_dir)/.${name}.XXXXXX")" || return 1
 	cat >"$tmp"
-	if [ -s "$tmp" ] && { ! command -v jq &>/dev/null || jq -e . "$tmp" >/dev/null 2>&1; }; then
+	if [ -s "$tmp" ] && { ! have jq || jq -e . "$tmp" >/dev/null 2>&1; }; then
 		# mktemp creates 0600. These artifacts carry no secrets and the collect step may not run as
 		# the user that produced them, so restore the 0644 a plain `>` redirect would have left —
 		# staging must not quietly narrow who can read the result.
@@ -220,16 +254,45 @@ bench_cmd() {
 
 # --- Phoronix Test Suite (PTS) helpers ---
 
-# The toolchain bakes profiles as root under /var/lib, but E2B-compatible providers inject an
-# unprivileged runtime user. PTS 10.8.4 supports this official override when the directory exists.
-# Set it here as a fallback in case an image importer strips the Docker ENV; the harness preamble does
-# the same before setup/smoke commands, so all PTS call sites see one registry.
+# The toolchain bakes profiles as root under /var/lib, but E2B-compatible providers (Runloop) inject
+# an unprivileged runtime user. Keep the installed profiles SHARED via the one path PTS 10.8.4 gives
+# its own env override, and leave that user's mutable state on PTS's own per-user default:
+#
+#   - Without PTS_TEST_INSTALL_ROOT_PATH an unprivileged run falls back to the config's
+#     ~/.phoronix-test-suite/installed-tests/ and reports ZERO installed tests, even though it can read
+#     the baked tree perfectly well. Set here as a fallback in case an image importer strips the Docker
+#     ENV, and because the published v7 image predates that ENV entirely.
+#   - PTS_USER_PATH_OVERRIDE is UNSET rather than repointed for a non-root user: PTS's default already
+#     IS $HOME/.phoronix-test-suite and PTS creates it itself, so there is no mkdir here to fail under
+#     `set -e` when HOME is unset or unwritable. Pointing that user at the baked root is what breaks —
+#     root's core.pt2so is mode 0600, and PTS expands its non-daemon ResultsDirectory through HOME
+#     regardless of the override, so the shared setting both warns on every invocation and leaves the
+#     composite finder below searching a tree PTS never writes.
+#
+# Root keeps the explicit override: redundant when PTS reaches its daemonized branch (writable /var/lib
+# AND /etc force PTS_USER_PATH to the baked root anyway), load-bearing when it does not.
+#
+# Mirrors PTS_STATE_SELECT_SH in packages/schema/src/toolchain.ts, which the harness preamble and the
+# generated smoke probe interpolate; this file cannot import TS, so the copy is gated as text by
+# tooling/repo-checks/src/pts-state-alignment.test.ts.
 if [ -d /var/lib/phoronix-test-suite ]; then
-	export PTS_USER_PATH_OVERRIDE=/var/lib/phoronix-test-suite/
+	export PTS_TEST_INSTALL_ROOT_PATH=/var/lib/phoronix-test-suite/installed-tests/
+	if [ "$(id -u)" -eq 0 ]; then
+		export PTS_USER_PATH_OVERRIDE=/var/lib/phoronix-test-suite/
+	else
+		unset PTS_USER_PATH_OVERRIDE
+	fi
 fi
 
-# Locate PTS's effective data directory. Prefer its supported override, then probe legacy root/user
-# locations by core.pt2so, which pts_init guarantees exists. Cached for the shell.
+# Locate PTS's effective data directory — where it keeps MUTABLE state (core.pt2so, user-config.xml,
+# test-results, and any vendored/local test-profiles we stage). Prefer its supported override, then
+# probe legacy root/user locations by core.pt2so, which pts_init guarantees exists. Cached for the
+# shell.
+#
+# The probe requires core.pt2so to be READABLE, not merely present: the baked /var/lib copy is mode
+# 0600 root, so an unprivileged run that fell through to it would resolve every caller below onto a
+# tree it cannot read or write — pts_config_file would name a config PTS never reads, and the
+# composite finder would search for results in a directory PTS never writes.
 _pts_user_dir_cached=""
 pts_init() {
 	# system-info is cheap and writes core.pt2so on first run; swallow all output.
@@ -243,23 +306,137 @@ pts_user_dir() {
 	local cand dir="${PTS_USER_PATH_OVERRIDE:-${HOME}/.phoronix-test-suite}"
 	for cand in "${PTS_USER_PATH_OVERRIDE:-}" "${HOME}/.phoronix-test-suite" "/var/lib/phoronix-test-suite" "/root/.phoronix-test-suite"; do
 		[ -n "$cand" ] || continue
-		if [ -e "${cand}/core.pt2so" ]; then
+		if [ -r "${cand}/core.pt2so" ]; then
 			dir="$cand"
 			break
 		fi
 	done
-	_pts_user_dir_cached="$dir"
-	echo "$dir"
+	_pts_user_dir_cached="${dir%/}"
+	echo "$_pts_user_dir_cached"
+}
+
+# Where PTS keeps INSTALLED tests. Distinct from pts_user_dir since the non-root split: the baked
+# installed tree stays shared under /var/lib via PTS_TEST_INSTALL_ROOT_PATH while an unprivileged
+# user's mutable state lives under its own HOME. Anything that inspects or removes an INSTALL must
+# resolve it through here — deriving it from pts_user_dir silently targets the wrong tree for every
+# non-root provider, so the removal no-ops and PTS keeps reporting the stale install as present.
+pts_install_root() {
+	local root="${PTS_TEST_INSTALL_ROOT_PATH:-$(pts_user_dir)/installed-tests}"
+	echo "${root%/}"
+}
+
+# Take ownership of a baked profile's INSTALLED dir when this sandbox's identity is not the bake's.
+# Returns non-zero when it cannot, so the caller can fall back rather than die mid-repair.
+#
+# 25-pts-profiles.sh leaves the tree a+rwX, which is enough to create, truncate and delete files —
+# and NOT enough for the repair-in-place leaves, because chmod is gated on OWNERSHIP, not on the mode
+# bits. A vendored install.sh that rewrites a launcher and ends with `chmod +x` therefore succeeds at
+# every write and then dies EPERM on the file it just wrote (stream, fast-cli). Writable is not
+# ownable: the mode says who may change the file's CONTENT, the owner is who may change its METADATA.
+claim_baked_profile_dir() {
+	local dir="${1:-}"
+	[ -d "$dir" ] || return 0
+	# A failed stat yields the empty string, which never equals a uid — no sentinel needed.
+	[ "$(stat -c '%u' "$dir" 2>/dev/null)" = "$UID" ] && return 0
+	# `have` gates on sudo EXISTING (no exec); the chown's own status then covers the NOPASSWD case, so
+	# there is no separate `sudo -n true` probe to keep in sync with the command that actually matters.
+	have sudo || return 1
+	sudo -n chown -R "${UID}:$(id -g)" "$dir" || return 1
+	echo "Claimed baked tree: ${dir} (now $(id -un))"
+}
+
+# Make the BAKED postgres cluster usable by whatever identity this sandbox runs as. No-op under the
+# identity that baked it (every root provider), so this is purely the non-root repair.
+#
+# The bake initdb's the cluster as root and 25-pts-profiles.sh must re-tighten pg_/data/db to 0700 —
+# postgres FATALs at startup on any group/other bit — which leaves an unprivileged runtime user with
+# two independent blockers, both identity mismatches with a baked artifact rather than sandbox faults:
+#
+#   1. it cannot read the data dir, so pg_ctl never starts the server at all; and
+#   2. the cluster's only role is the bake's initdb user, while the profile's generated run script
+#      passes no -U anywhere (createdb/pgbench/psql), so libpq defaults to the OS username and the
+#      server answers `FATAL: role "<user>" does not exist` — surfacing as pgbench's opaque
+#      "could not create connection for setup" with every trial empty.
+#
+# Claim the cluster rather than rebuilding it: a runtime re-initdb would be simpler but would silently
+# vary encoding/locale/page layout per provider, and pgbench numbers are only comparable across
+# providers when the cluster underneath them is the same one. Ownership is the only thing that changes.
+#
+# Every abort below funnels through here: the two pgbench modes share one cluster, so a recovery this
+# function cannot FINISH leaves neither of them runnable, and under the leaf's `set -e` a bare failure
+# would exit with no marker on either prefix. Exit 0 because the skip markers ARE the outcome — an
+# honest recorded gap on both modes, not the opaque libpq error an unrepaired cluster reaches.
+_skip_pgbench_modes() {
+	local prefix
+	for prefix in pts_pgbench-read-only pts_pgbench-read-write; do
+		skip_result "$1" "$prefix"
+	done
+	exit 0
+}
+claim_baked_pg_cluster() {
+	local pgdata marker owner
+	pgdata="$(pts_install_root)/pts/pgbench-1.15.0/pg_/data/db"
+	# Beside the data dir, never inside it: the 0700 mode is postgres's requirement, and a stray file
+	# in there is one more thing checkDataDir can object to.
+	marker="${pgdata%/*}/.bootstrap-role"
+	[ -d "$pgdata" ] || return 0
+
+	# A claim in an EARLIER leaf of this run (or an earlier run in a long-lived sandbox) already took
+	# ownership, which erases the evidence of who initdb'd it. The recorded role is still the cluster's
+	# only superuser, so replay it — without this, every leaf after the first reverts to libpq's OS
+	# username default and fails exactly the way an unclaimed cluster does.
+	if [ -r "$marker" ]; then
+		PGUSER="$(cat "$marker")"
+		export PGUSER
+		return 0
+	fi
+
+	# Readable means this identity baked the cluster (every root provider) — nothing to repair.
+	[ ! -r "$pgdata" ] || return 0
+
+	# The data dir's owner IS initdb's user, hence the cluster's bootstrap superuser. Read it BEFORE
+	# the chown rewrites it, and export it so libpq stops defaulting to an OS username with no role.
+	# Losing the owner is not a survivable warning: it is the bootstrap role itself. Continuing would
+	# chown the dir (or not) and leave PGUSER unset, and the NEXT invocation then reads a pgdata this
+	# identity can suddenly read and returns at the check above — so the whole recovery is skipped for
+	# good and both modes die on libpq's OS-username default.
+	owner="$(stat -c '%U' "$pgdata" 2>/dev/null || true)"
+	if [ -z "$owner" ]; then
+		_skip_pgbench_modes "could not read the owner of ${pgdata} to recover the baked cluster's bootstrap role"
+	fi
+
+	# One elevation policy for both claims — see claim_baked_profile_dir. An unclaimable cluster is a
+	# diagnosable permission problem, so record it rather than letting it reach the confusing libpq
+	# error.
+	if ! claim_baked_profile_dir "$pgdata"; then
+		_skip_pgbench_modes "could not claim the ${owner}-owned baked postgres data dir (needs sudo)"
+	fi
+	export PGUSER="$owner"
+	# Record only after the chown succeeded: a marker written ahead of it would make a failed claim
+	# look complete to the next leaf, which would then skip the repair and fail on an unreadable dir.
+	#
+	# And treat a failed write as a failed recovery even though THIS process is already exported and
+	# would run fine: the chown has erased the only other evidence of who initdb'd the cluster, so
+	# without the marker the next invocation in a long-lived sandbox reads an owned, readable pgdata,
+	# returns early with no PGUSER, and fails opaquely. Skip loudly here instead of banking a run whose
+	# successor is already broken.
+	# No 2>/dev/null: a redirection that fails is reported by the SHELL, before the command it belongs
+	# to runs, so suppression there would be dead weight — and bash's own message names the errno the
+	# skip reason can't.
+	if ! echo "$owner" >"$marker"; then
+		_skip_pgbench_modes "claimed ${pgdata} but could not record its bootstrap role at ${marker}"
+	fi
+	echo "Claimed baked postgres cluster: ${pgdata} (now $(id -un), connecting as role ${PGUSER})"
 }
 
 # Resolve the config file PTS itself reads and writes, mirroring its own selection order
 # (pts_config::get_config_file_location + pts_config_nye_XmlReader::__construct, v10.8.4). PTS sets
-# PTS_IS_DAEMONIZED_SERVER_PROCESS whenever /var/lib AND /etc are both writable — i.e. whenever it
-# runs as root, which is every sandbox provider here — and in that mode it uses
+# PTS_IS_DAEMONIZED_SERVER_PROCESS whenever /var/lib AND /etc are both writable — normally when the
+# sandbox runs as root — and in that mode it uses
 # /etc/phoronix-test-suite.xml UNCONDITIONALLY, without so much as probing the user dir. So under
 # root, user-config.xml is the file PTS never touches, and /etc is the live config. An unprivileged
-# run falls through to ${PTS_USER_PATH}/user-config.xml (the baked override here) — and even then a
-# writable /etc/phoronix-test-suite.xml, if one exists, still wins.
+# run falls through to ${PTS_USER_PATH}/user-config.xml — and even then a writable
+# /etc/phoronix-test-suite.xml, if one exists, still wins.
 pts_config_file() {
 	if { [ -w /var/lib ] && [ -w /etc ]; } || [ -w /etc/phoronix-test-suite.xml ]; then
 		echo /etc/phoronix-test-suite.xml
@@ -305,6 +482,7 @@ _pts_install_diagnostics() {
 	echo "--- PTS install diagnostics: ${test_name} ---"
 	echo "user=$(id -un 2>/dev/null) HOME=${HOME}"
 	echo "resolved pts_user_dir=${pts_dir}"
+	echo "resolved pts_install_root=$(pts_install_root)"
 	echo "resolved pts_config_file=$(pts_config_file)"
 	for d in "${data_dirs[@]}"; do
 		[ -e "$d/core.pt2so" ] && echo "  core.pt2so present in: $d"
@@ -314,8 +492,8 @@ _pts_install_diagnostics() {
 	echo "  install manifests on disk:"
 	find "${data_dirs[@]}" -maxdepth 5 \( -name pts-install.json -o -name pts-install.xml \) \
 		2>/dev/null | sed 's/^/    /' || true
-	echo "  installed-tests tree (${pts_dir}/installed-tests):"
-	find "${pts_dir}/installed-tests" -maxdepth 3 2>/dev/null | sed 's/^/    /' | head -40 || true
+	echo "  installed-tests tree ($(pts_install_root)):"
+	find "$(pts_install_root)" -maxdepth 3 2>/dev/null | sed 's/^/    /' | head -40 || true
 	local log
 	log=$(find "${data_dirs[@]}" -name install-failed.log -exec ls -t {} + 2>/dev/null | head -1)
 	if [ -n "$log" ] && [ -f "$log" ]; then
@@ -410,9 +588,9 @@ _configure_pts_batch() {
 # this normally just configures batch mode; the apt fallback is for stock images. Returns 1 (without
 # aborting) when PTS can't be made available, so the caller can skip rather than fail.
 ensure_pts() {
-	if ! command -v phoronix-test-suite &>/dev/null; then
+	if ! have phoronix-test-suite; then
 		echo "phoronix-test-suite not found, attempting install..."
-		if command -v apt-get &>/dev/null; then
+		if have apt-get; then
 			local pts_version="10.8.4"
 			local deb_url="https://github.com/phoronix-test-suite/phoronix-test-suite/releases/download/v${pts_version}/phoronix-test-suite_${pts_version}_all.deb"
 			local tmp_deb
@@ -434,7 +612,7 @@ ensure_pts() {
 			rm -f "$tmp_deb"
 		fi
 	fi
-	if ! command -v phoronix-test-suite &>/dev/null; then
+	if ! have phoronix-test-suite; then
 		echo "(could not install phoronix-test-suite, skipping PTS benchmarks)"
 		return 1
 	fi
@@ -555,13 +733,26 @@ install_vendored_pts_profile() {
 	local pts_dir profile_dst installed_dst
 	pts_dir="$(pts_user_dir)"
 	profile_dst="${pts_dir}/test-profiles/pts/${name}"
-	installed_dst="${pts_dir}/installed-tests/pts/${name}"
+	# The INSTALL root, not pts_user_dir: for a non-root sandbox the baked installed tree stays under
+	# /var/lib while mutable state moved to HOME. Removing "${pts_dir}/installed-tests/..." there would
+	# delete nothing, _pts_is_installed would still report the BAKED upstream copy as present, and the
+	# leaf would benchmark the very runner this override exists to replace — silently, since a skipped
+	# reinstall is the normal fast path.
+	installed_dst="$(pts_install_root)/pts/${name}"
 	mkdir -p "$(dirname "$profile_dst")"
 	rm -rf "$profile_dst"
 	cp -r "$src" "$profile_dst"
 	# The image bakes the upstream profile. Removing only this pinned install makes the ordinary
 	# run_pts_benchmark path reinstall our staged source and retain all of its exit/registry checks.
 	rm -rf "$installed_dst"
+
+	# Assert the discard actually landed: a stale install here is the difference between benchmarking
+	# the vendored repair and benchmarking the broken upstream runner, and both look identical in the
+	# leaf's output. Cheap, and it fails loudly at stage time instead of publishing wrong numbers.
+	if [ -e "$installed_dst" ]; then
+		echo "ERROR: install_vendored_pts_profile: baked install still present at ${installed_dst}" >&2
+		return 1
+	fi
 
 	echo "Staged vendored PTS override: ${profile_dst} (removed ${installed_dst})"
 }
@@ -760,7 +951,7 @@ fio_direct_choice() {
 	# Without PTS the answer is irrelevant (the leaf's availability guard skips before running fio) —
 	# return without probing OR caching, so a dep-less dry run can't persist a verdict probed against
 	# the wrong filesystem for a later, properly-provisioned run to reuse.
-	if ! command -v phoronix-test-suite >/dev/null 2>&1; then
+	if ! have phoronix-test-suite; then
 		echo "No"
 		return 0
 	fi
@@ -780,7 +971,14 @@ fio_direct_choice() {
 	# /var/lib/phoronix-test-suite while run_pts_benchmark's composite finder searches the stale
 	# cached dir and records a bogus "produced no composite.xml" skip for every scenario.
 	pts_init
-	dir="$(pts_user_dir)"
+	# Probe the INSTALL root, because that is where fio's own scratch file goes (its installed-test
+	# dir), and O_DIRECT is a property of the filesystem, not of the process. Since the non-root split
+	# these can be different filesystems on the same sandbox — on Blaxel /var/lib/phoronix-test-suite is
+	# a separate mounted volume while HOME is the RAM-backed root — so probing pts_user_dir would pin
+	# Direct=Yes against an overlay that supports it while every fio scenario EINVALs on the real
+	# target, or pin Direct=No and publish buffered numbers under the same metric id as the root
+	# providers' O_DIRECT ones.
+	dir="$(pts_install_root)"
 	mkdir -p "$dir"
 	probe="${dir}/.o-direct-probe"
 	# bs=4096, not 512: O_DIRECT requires logical-sector alignment, so a 512-byte write EINVALs on a
@@ -818,7 +1016,7 @@ fio_direct_choice() {
 # Usage: run_pinned_pts <versioned-test> <results-prefix> <preset-options>
 run_pinned_pts() {
 	local test_name="$1" prefix="$2" presets="$3"
-	if ! command -v phoronix-test-suite &>/dev/null; then
+	if ! have phoronix-test-suite; then
 		skip_result "phoronix-test-suite not installed" "$prefix"
 		return 0
 	fi
@@ -872,11 +1070,11 @@ run_realworld_pts() {
 	local profile="realworld-${repo}-1.0.0"
 	local prefix="pts_realworld-${repo}"
 
-	if ! command -v phoronix-test-suite &>/dev/null; then
+	if ! have phoronix-test-suite; then
 		skip_result "phoronix-test-suite not installed" "$prefix"
 		return 0
 	fi
-	if ! command -v node &>/dev/null; then
+	if ! have node; then
 		skip_result "node not installed" "$prefix"
 		return 0
 	fi

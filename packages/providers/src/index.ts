@@ -1,57 +1,41 @@
-// Public surface of @sandbox-benchmarks/providers.
-// Depends on @sandbox-benchmarks/schema (provider identity) and computesdk + the @computesdk/*
-// wrappers (the unified provider runtime). Each provider is wired via its @computesdk/* factory;
-// `providers` is the schema identity joined with those adapters.
+// Legacy bake helpers and evidence utilities. Benchmark execution uses @sandbox-benchmarks/drivers.
 import { PROVIDERS } from "@sandbox-benchmarks/schema";
-import { adapters } from "./lib/adapters.ts";
-import { assertProviderJoin } from "./lib/join.ts";
+import { adapters, isLegacyAdapterId, MIGRATED_DRIVER_IDS } from "./lib/adapters.ts";
+import { assertCreateCeilingDeclared, assertProviderJoin } from "./lib/join.ts";
 import type { ProviderConfig } from "./lib/types.ts";
 
 // The runtime configuration gatekeeper — the single validated config object consumers import.
-export { createMicrosandboxCloudCompute } from "./lib/adapters.ts";
-export { config } from "./lib/config.ts";
-export type {
-	MicrosandboxCloudConfig,
-	MicrosandboxConfig,
-	MicrosandboxHandle,
-	MicrosandboxLocalConfig,
-	MicrosandboxVariant,
-} from "./lib/microsandbox.ts";
-export { microsandboxCloudCompute, microsandboxLocalCompute } from "./lib/microsandbox.ts";
+export { config } from "./config.ts";
+export type { LegacyAdapterId, MigratedDriverId } from "./lib/adapters.ts";
+export { sanitizeEvidenceDetail, sanitizeProviderResponse } from "./lib/cost-evidence.ts";
 // Novita's E2B-compat surface: the pinned regional domain + connection the bake pipeline reuses,
 // and the compat factory (exported for tests and for anyone driving Novita outside the harness join).
 export { NOVITA_E2B_DOMAIN, novitaCompute, novitaConnection } from "./lib/novita.ts";
-export type { DirectProvider, ProviderAdapter, ProviderConfig } from "./lib/types.ts";
+// How an adapter reports a create failure the harness should wait out rather than fail on.
+export { isRetryableCreateError, markRetryableCreate } from "./lib/retryable-create.ts";
+export type {
+	CostEvidenceCaptureInput,
+	DirectProvider,
+	ProviderAdapter,
+	ProviderConfig,
+	ProviderCostEvidenceCapability,
+	SandboxTeardownResult,
+} from "./lib/types.ts";
+export { isLegacyAdapterId, MIGRATED_DRIVER_IDS };
 
-/**
- * All provider benchmark configurations: each schema provider's identity joined with its harness
- * adapter, in schema declaration order.
- *
- * No runtime reconciliation is needed because both sides are keyed by the same `ProviderId`:
- * `PROVIDERS` is derived from the schema's `Record<ProviderId, …>` registry and `adapters` is a
- * `Record<ProviderId, ProviderAdapter>`, so every `meta.id` indexes exactly one adapter and the two
- * registries are provably the same set at compile time.
- *
- * The runtime {@link assertProviderJoin} below backs that compile-time guarantee for any path the
- * type-checker never saw — a published/installed build or a cross-version schema/providers drift —
- * failing loudly at module load rather than letting a one-sided provider surface as an `undefined`
- * adapter mid-run.
- */
+// Keep the registry join checked while legacy consumers still import this compatibility surface.
 assertProviderJoin(
-	PROVIDERS.map((meta) => meta.id),
+	PROVIDERS.map((meta) => meta.id).filter(isLegacyAdapterId),
 	Object.keys(adapters),
 );
 
-export const providers: ProviderConfig[] = PROVIDERS.map((meta) => {
-	const adapter = adapters[meta.id];
-	return {
-		...adapter,
-		name: meta.id,
-		// The adapter may refine the required credentials at runtime (daytona's per-region key var);
-		// otherwise the schema ProviderMeta's static list stands.
-		requiredEnvVars: adapter.requiredEnvVars ?? meta.requiredEnvVars,
-		// Transport capability is schema-owned (a static fact of the @computesdk/* integration), so it
-		// rides the same id-keyed join — the harness reads it to pick sync vs detached per step.
-		transport: meta.transport,
-	};
-});
+// An adapter that owns its own create bound must say how large that bound is; the harness's retry
+// budget is only honest if it can subtract one attempt's worst case before starting another.
+assertCreateCeilingDeclared(adapters);
+
+// All registered providers now run through DriverModule. Keep the empty legacy surface while
+// bake helpers and evidence sanitization still use this package.
+export const providers: ProviderConfig[] = [];
+
+// Compatibility for the fork's unscored diagnostic workflow only.
+export { microsandboxCloudCompute } from "./lib/microsandbox.ts";

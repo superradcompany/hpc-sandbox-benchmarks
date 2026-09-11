@@ -10,7 +10,7 @@
 // Actions HTML table rendering lives in suite-summary.ts so this module stays free of Toolkit/
 // presentation concerns. Callers pass an explicit `root` (tests) or default to process.cwd()
 // (CI / local bins already run from the monorepo root).
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
 import type { SuiteName } from "@sandbox-benchmarks/schema";
 import { getMetric, SUITES } from "@sandbox-benchmarks/schema";
@@ -116,6 +116,21 @@ export function ptsPinsFromScript(
 	return pins;
 }
 
+/**
+ * The `#MISE description=` a file task declares, which is exactly what `mise task info` would report
+ * for it. Read straight from the script so a summary still names its tasks when the mise binary is
+ * absent — the same degradation the conventional task-file path already provides, applied to the
+ * description instead of only to the path. Without it, every task in a summary rendered on a machine
+ * without mise is a bare id with no explanation of what it runs.
+ *
+ * Accepts both quoted and bare forms, and only on the `#MISE` directive line, so ordinary prose in a
+ * task header can never be mistaken for a declaration.
+ */
+export function descriptionFromScript(script: string): string {
+	const match = script.match(/^#MISE\s+description\s*=\s*(?:"([^"]*)"|'([^']*)'|(.*))$/m);
+	return (match?.[1] ?? match?.[2] ?? match?.[3] ?? "").trim();
+}
+
 /** Strip `#` comment lines so pin mining can't latch onto commented-out calls. */
 function stripBashComments(text: string): string {
 	return text
@@ -205,12 +220,29 @@ function relFile(absOrRel: string, root: string): string {
 	return rel.startsWith("..") ? "" : rel;
 }
 
-/** Resolve a task file under the repo root — mise path first, then the conventional file layout. */
+/**
+ * Resolve a task file under the repo root — mise path first, then the conventional file layout.
+ *
+ * A conventional path can land on a DIRECTORY rather than a file: mise lets a group carry its own
+ * task as `<group>/_default` (`.mise/tasks/a/b/_default` loads as `a:b`), which is how
+ * `benchmark:system:provider` gained sibling leaves without being renamed. `existsSync` is true for
+ * that directory, so testing existence alone would report a directory as the task file and then mine
+ * zero pins from it. Check for a file, and fall through to the group's `_default`.
+ */
 function resolveTaskFile(task: string, miseFile: string | undefined, root: string): string {
+	const isFile = (rel: string): boolean => {
+		try {
+			return statSync(resolve(root, rel)).isFile();
+		} catch {
+			return false;
+		}
+	};
 	const fromMise = miseFile ? relFile(miseFile, root) : "";
-	if (fromMise && existsSync(resolve(root, fromMise))) return fromMise;
+	if (fromMise && isFile(fromMise)) return fromMise;
 	const conventional = conventionalTaskFile(task);
-	if (existsSync(resolve(root, conventional))) return conventional;
+	if (isFile(conventional)) return conventional;
+	const grouped = `${conventional}/_default`;
+	if (isFile(grouped)) return grouped;
 	return fromMise;
 }
 
@@ -282,7 +314,9 @@ export async function describeSuiteTasks(
 		const pins = script ? ptsPinsFromScript(script, { fioProfile, realworldVersion }) : [];
 		tasks.push({
 			task: taskName,
-			description: info?.description ?? "",
+			// mise's answer wins when it has one; the script's own `#MISE description=` is the fallback
+			// so the summary is identical with or without a mise binary on PATH.
+			description: info?.description || (script ? descriptionFromScript(script) : ""),
 			file,
 			role,
 			ptsProfile: joinPins(pins, "ptsProfile"),
