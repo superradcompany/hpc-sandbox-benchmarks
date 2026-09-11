@@ -596,6 +596,7 @@ export function checkToolchainPrScope(
 	if (
 		smoke["runs-on"] !== "starsling-ubuntu-24.04-2" &&
 		smoke["runs-on"] !==
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: Literal GitHub Actions expression.
 			"${{ github.repository_owner == 'superradcompany' && 'ubuntu-24.04' || 'starsling-ubuntu-24.04-2' }}"
 	) {
 		errors.push(`${jobLabel}: must use the standard 2-vCPU runner \`starsling-ubuntu-24.04-2\``);
