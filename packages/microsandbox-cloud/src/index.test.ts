@@ -108,12 +108,12 @@ function fakeBuilder(create: () => Promise<unknown>) {
 	return { builder: builder as unknown as ReturnType<typeof MsbSandbox.builder>, calls };
 }
 
-function fakeHandle(name: string, status = "running") {
+function fakeHandle(name: string, status = "running", labels: Record<string, string> = {}) {
 	const events: string[] = [];
 	const handle = {
 		name,
 		status,
-		configJson: JSON.stringify({ labels: { [MICROSANDBOX_LABEL_MARKER]: "microsandbox-cloud" } }),
+		configJson: JSON.stringify({ labels }),
 		createdAt: new Date("2026-09-10T00:00:00Z"),
 		requestStop: async () => {
 			events.push("requestStop");
@@ -399,7 +399,7 @@ describe("Microsandbox Cloud lifecycle through the bridge", () => {
 });
 
 describe("Microsandbox Cloud account inventory and recovery", () => {
-	test("drains every cursor page, owns by name shape, and counts the rest as foreign", async () => {
+	test("drains every page and recovers labelled and legacy sandboxes only", async () => {
 		const pages = [
 			{
 				sandboxes: [fakeHandle(OWNED_A, "running").handle, fakeHandle("dev-box", "running").handle],
@@ -409,6 +409,13 @@ describe("Microsandbox Cloud account inventory and recovery", () => {
 				sandboxes: [
 					fakeHandle(OWNED_B, "stopped").handle,
 					fakeHandle("other-stopped", "stopped").handle,
+					fakeHandle("other-failed", "failed").handle,
+					fakeHandle("labelled-legacy", "stopped", {
+						[MICROSANDBOX_LABEL_MARKER]: "microsandbox-cloud",
+					}).handle,
+					fakeHandle("bench-cloud-00000000-0000-0000-0000-000000000000", "running", {
+						[MICROSANDBOX_LABEL_MARKER]: "another-provider",
+					}).handle,
 				],
 				nextCursor: undefined,
 			},
@@ -433,8 +440,12 @@ describe("Microsandbox Cloud account inventory and recovery", () => {
 		);
 		const driver = microsandboxCloud.driver(context);
 		expect(await driver.inventory?.list()).toEqual({
-			owned: [sandboxRef("microsandbox-cloud", OWNED_A), sandboxRef("microsandbox-cloud", OWNED_B)],
-			foreignCount: 2,
+			owned: [
+				sandboxRef("microsandbox-cloud", OWNED_A),
+				sandboxRef("microsandbox-cloud", OWNED_B),
+				sandboxRef("microsandbox-cloud", "labelled-legacy"),
+			],
+			foreignCount: 0,
 		});
 		expect(cursors).toEqual([undefined, "page-2"]);
 	});
@@ -472,9 +483,20 @@ describe("Microsandbox Cloud account inventory and recovery", () => {
 		await expect(
 			driver.destroyById?.(sandboxRef("microsandbox-cloud", OWNED_A)),
 		).rejects.toMatchObject({ code: "destroy-failed", provider: "microsandbox-cloud" });
+		const unrelated = fakeHandle("not-ours", "running");
+		get.mockResolvedValueOnce(unrelated.handle);
 		await expect(
 			driver.destroyById?.(sandboxRef("microsandbox-cloud", "not-ours")),
-		).rejects.toMatchObject({ code: "invalid-sandbox-ref" });
+		).rejects.toMatchObject({ code: "destroy-failed" });
+		expect(unrelated.events).toEqual([]);
+		expect(removed).toEqual([OWNED_A]);
+
+		const labelled = fakeHandle("labelled-legacy", "stopped", {
+			[MICROSANDBOX_LABEL_MARKER]: "microsandbox-cloud",
+		});
+		get.mockResolvedValueOnce(labelled.handle);
+		await driver.destroyById?.(sandboxRef("microsandbox-cloud", "labelled-legacy"));
+		expect(removed).toEqual([OWNED_A, "labelled-legacy"]);
 	});
 
 	test("observes running, terminal-but-present, and absent records distinctly", async () => {
