@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExecResult, SandboxSession } from "@sandbox-benchmarks/driver";
 import { loadDriverModule } from "@sandbox-benchmarks/drivers";
+import { cleanupOwnedSandboxes } from "@sandbox-benchmarks/harness";
 import { evaluateExperiment } from "@sandbox-benchmarks/results";
 import { TOOLCHAIN_VERSION } from "@sandbox-benchmarks/schema/toolchain";
 import type { AccountRecord } from "./account-journal.ts";
@@ -139,7 +140,16 @@ async function fixture(name: string, failCleanup = false) {
 			},
 		},
 	};
-	return { options, records, events, present, peak: () => peak };
+	return {
+		options,
+		records,
+		events,
+		present,
+		peak: () => peak,
+		allowCleanup: () => {
+			failCleanup = false;
+		},
+	};
 }
 
 test("planned batch crosses the real harness, raw collector, normalizer and publication evaluator", async () => {
@@ -160,12 +170,17 @@ test("planned batch crosses the real harness, raw collector, normalizer and publ
 
 test("cleanup failure retains account ownership and blocks publication", async () => {
 	const f = await fixture("cleanup", true);
-	const attempts = await executeExperimentBatch(f.options);
-	expect(
-		attempts.every((attempt) => attempt.cleanup === "unresolved" && attempt.outcome === "failed"),
-	).toBe(true);
-	expect(f.records.filter((record) => record.kind === "released")).toHaveLength(0);
-	expect(batchIsComplete(plan, f.options.root, attempts)).toBe(false);
+	try {
+		const attempts = await executeExperimentBatch(f.options);
+		expect(
+			attempts.every((attempt) => attempt.cleanup === "unresolved" && attempt.outcome === "failed"),
+		).toBe(true);
+		expect(f.records.filter((record) => record.kind === "released")).toHaveLength(0);
+		expect(batchIsComplete(plan, f.options.root, attempts)).toBe(false);
+	} finally {
+		f.allowCleanup();
+		await cleanupOwnedSandboxes();
+	}
 });
 
 test("missing inventory fails each planned replicate without creating", async () => {
